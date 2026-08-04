@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import time
 from pathlib import Path
 from typing import Optional
@@ -57,11 +58,24 @@ def config_set(
         None, "--api-key", help="LLM API key, used for every agent call."
     ),
     model: Optional[str] = typer.Option(
-        None, "--model", help="Model name used for every agent (e.g. gpt-5-mini)."
+        None, "--model", help="Model name used for every agent (e.g. gpt-5-mini, claude-sonnet-4-5)."
+    ),
+    provider: Optional[str] = typer.Option(
+        None,
+        "--provider",
+        help="Model provider (e.g. openai, anthropic, google_genai, groq). "
+        "Defaults to openai if never set. Determines which API key env var "
+        "(dev mode) and which integration package is used.",
     ),
 ):
     """Save one or more defaults. Flags you omit are left unchanged."""
-    if master_resume is None and output_dir is None and api_key is None and model is None:
+    if (
+        master_resume is None
+        and output_dir is None
+        and api_key is None
+        and model is None
+        and provider is None
+    ):
         typer.secho("No values given — nothing changed.", fg=typer.colors.YELLOW)
         raise typer.Exit(code=1)
 
@@ -74,6 +88,8 @@ def config_set(
         cfg.api_key = api_key
     if model is not None:
         cfg.model = model
+    if provider is not None:
+        cfg.provider = provider
 
     save_config(cfg)
     typer.secho(f"Saved to {CONFIG_PATH}", fg=typer.colors.GREEN)
@@ -94,6 +110,7 @@ def config_show():
         "master_resume": cfg.master_resume,
         "output_dir": cfg.output_dir,
         "api_key": redacted_key,
+        "provider": cfg.provider,
         "model": cfg.model,
     }
     for key, value in fields.items():
@@ -110,41 +127,73 @@ _STAGE_LABELS = {
 
 
 async def _run_with_progress(job_url: str, cv_path: str, output_dir: str) -> dict:
-    """Consumes the pipeline's stage-by-stage stream and prints a line as
-    each one completes (with elapsed time for that stage), so the CLI
-    shows live progress instead of sitting silent for the couple of
-    minutes a full run takes. Also accumulates every stage's state update
-    into one dict, since streaming mode only yields the diff per node,
-    not the final merged state."""
+    """Consumes the pipeline's stage-by-stage stream and shows three
+    distinct states per stage: an init line printed the moment a stage
+    starts, a live-ticking spinner while it's processing (LangGraph's
+    "updates" stream mode only yields once a node *finishes*, so without
+    this there's dead silence for however long the slowest stage takes —
+    gather_inputs alone routinely runs 60-80s), and a checkmark/failure
+    line once it's done. Also accumulates every stage's state update into
+    one dict, since streaming mode only yields the diff per node, not the
+    final merged state."""
     final_state: dict = {}
     start = time.perf_counter()
     stage_start = start
+    current_label = _STAGE_LABELS["gather_inputs"]
 
-    async for node_name, update in stream_resume_pipeline(job_url, cv_path, output_dir):
-        now = time.perf_counter()
-        elapsed = now - stage_start
-        stage_start = now
-        final_state.update(update)
-        label = _STAGE_LABELS.get(node_name, node_name)
+    async def _tick(status) -> None:
+        while True:
+            elapsed = time.perf_counter() - stage_start
+            status.update(f"[cyan]{current_label}...[/cyan] [dim]({elapsed:0.0f}s)[/dim]")
+            await asyncio.sleep(0.5)
 
-        if update.get("failed_stage"):
-            console.print(f"[dim]{elapsed:5.1f}s[/dim] [red]✗[/red] {label} failed")
-            break
+    console.print(f"[cyan]▶[/cyan] {current_label}...")
 
-        if node_name == "tailor":
-            attempt = update.get("verification_attempts")
-            console.print(f"[dim]{elapsed:5.1f}s[/dim] [green]✓[/green] {label} (attempt {attempt})")
-        elif node_name == "verify":
-            if update.get("verification_passed"):
-                console.print(f"[dim]{elapsed:5.1f}s[/dim] [green]✓[/green] {label} — passed")
-            else:
-                feedback = update.get("verification_feedback") or "no reason given"
-                console.print(
-                    f"[dim]{elapsed:5.1f}s[/dim] [yellow]…[/yellow] {label} — "
-                    f"failed, retrying: {feedback}"
-                )
-        else:
-            console.print(f"[dim]{elapsed:5.1f}s[/dim] [green]✓[/green] {label}")
+    with console.status(f"[cyan]{current_label}...[/cyan]", spinner="dots") as status:
+        ticker = asyncio.create_task(_tick(status))
+        try:
+            async for node_name, update in stream_resume_pipeline(job_url, cv_path, output_dir):
+                now = time.perf_counter()
+                elapsed = now - stage_start
+                stage_start = now
+                final_state.update(update)
+                label = _STAGE_LABELS.get(node_name, node_name)
+
+                if update.get("failed_stage"):
+                    console.print(f"[dim]{elapsed:5.1f}s[/dim] [red]✗[/red] {label} failed")
+                    break
+
+                if node_name == "gather_inputs":
+                    console.print(f"[dim]{elapsed:5.1f}s[/dim] [green]✓[/green] {label}")
+                    current_label = _STAGE_LABELS["tailor"]
+                elif node_name == "tailor":
+                    attempt = update.get("verification_attempts")
+                    console.print(
+                        f"[dim]{elapsed:5.1f}s[/dim] [green]✓[/green] {label} (attempt {attempt})"
+                    )
+                    current_label = _STAGE_LABELS["verify"]
+                elif node_name == "verify":
+                    if update.get("verification_passed"):
+                        console.print(f"[dim]{elapsed:5.1f}s[/dim] [green]✓[/green] {label} — passed")
+                        current_label = _STAGE_LABELS["generate"]
+                    else:
+                        feedback = update.get("verification_feedback") or "no reason given"
+                        console.print(
+                            f"[dim]{elapsed:5.1f}s[/dim] [yellow]…[/yellow] {label} — "
+                            f"failed, retrying: {feedback}"
+                        )
+                        current_label = f"{_STAGE_LABELS['tailor']} (retry)"
+                else:
+                    console.print(f"[dim]{elapsed:5.1f}s[/dim] [green]✓[/green] {label}")
+
+                # No "next stage" line once generate succeeds — it's the
+                # terminal stage, there's nothing left to announce.
+                if not update.get("failed_stage") and node_name != "generate":
+                    console.print(f"[cyan]▶[/cyan] {current_label}...")
+        finally:
+            ticker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ticker
 
     total = time.perf_counter() - start
     console.print(f"[dim]Total: {total:.1f}s[/dim]")
