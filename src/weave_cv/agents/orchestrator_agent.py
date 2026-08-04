@@ -34,7 +34,7 @@ from weave_cv.schemas.cv_analysis import CVProfile
 from weave_cv.schemas.jd_analysis import JobDescriptionAnalysis
 from weave_cv.services.cv_diff import diff_cv_profiles
 
-MAX_VERIFICATION_ATTEMPTS = 1
+MAX_VERIFICATION_ATTEMPTS = 3
 
 
 # --- Errors -------------------------------------------------------------

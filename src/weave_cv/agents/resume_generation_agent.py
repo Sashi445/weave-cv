@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from pathlib import Path
 
 from langchain.agents import create_agent
@@ -48,20 +49,22 @@ def _split_preamble_and_body(tex_str: str) -> tuple[str, str]:
     return preamble, body
 
 
-def _safe_filename(name: str | None, jd_analysis: JobDescriptionAnalysis | None) -> str:
-    if not name:
-        return "resume"
-    if not jd_analysis:
-        return "resume"
-    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_")
-    company_name = jd_analysis.company_name or "company"
-    title = jd_analysis.title or "job_title"
-    safe_company = re.sub(r"[^A-Za-z0-9]+", "_", company_name).strip("_")
-    safe_title = re.sub(r"[^A-Za-z0-9]+", "_", title).strip("_")
-    from datetime import datetime
-    time = datetime.now().strftime("%d %b %Y")
-    safe = f"{safe_name}_{safe_company}_{safe_title}_{time}"
-    return safe or "resume"
+def _slugify(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_")
+
+
+def _safe_filename(master_tex_path: str, jd_analysis: JobDescriptionAnalysis | None) -> str:
+    """master_resume_name + company_name + timestamp. Uses the master
+    .tex file's own name, not the CVProfile's contact.name — the file
+    naming is about which template/run produced this output, not who the
+    resume belongs to. Timestamp is full date+time (not date-only) and
+    has no spaces, since a date-only name collides on same-day reruns
+    against the same company (silently overwriting the earlier file) and
+    a space in the filename is fragile for shell scripting/globbing."""
+    master_name = _slugify(Path(master_tex_path).stem) or "resume"
+    company_name = _slugify(jd_analysis.company_name) if jd_analysis and jd_analysis.company_name else "company"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{master_name}_{company_name}_{timestamp}"
 
 
 _LATEX_ESCAPE_MAP = {
@@ -130,7 +133,7 @@ async def generate_resume(
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     full_tex = f"{preamble}\\begin{{document}}\n{escaped_body}\n\\end{{document}}\n"
 
-    filename = _safe_filename(cv_profile.contact.name, jd_analysis)
+    filename = _safe_filename(master_tex_path, jd_analysis)
     tex_path = Path(output_dir) / f"{filename}.tex"
     tex_path.write_text(full_tex, encoding="utf-8")
 

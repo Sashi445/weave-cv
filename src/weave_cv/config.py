@@ -20,6 +20,7 @@ class WeaveCVConfig(BaseModel):
     output_dir: str | None = None
     api_key: str | None = None
     model: str | None = None
+    provider: str | None = None
 
 
 def load_config() -> WeaveCVConfig:
