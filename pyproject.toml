@@ -10,6 +10,7 @@ dependencies = [
     "langchain-mcp-adapters>=0.3.0",
     "langchain-openai>=1.4.1",
     "mcp>=1.28.1,<2",
+    "openpyxl>=3.1.5",
     "pypandoc>=1.17",
     "rich>=13.9.0",
     "texsoup>=0.3.3",

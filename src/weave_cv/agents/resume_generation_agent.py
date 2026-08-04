@@ -57,13 +57,18 @@ def _safe_filename(master_tex_path: str, jd_analysis: JobDescriptionAnalysis | N
     """master_resume_name + company_name + timestamp. Uses the master
     .tex file's own name, not the CVProfile's contact.name — the file
     naming is about which template/run produced this output, not who the
-    resume belongs to. Timestamp is full date+time (not date-only) and
-    has no spaces, since a date-only name collides on same-day reruns
-    against the same company (silently overwriting the earlier file) and
-    a space in the filename is fragile for shell scripting/globbing."""
+    resume belongs to. Timestamp is full date+time with microseconds
+    (not date-only, not second-only) and has no spaces: a date-only name
+    collides on same-day reruns against the same company (silently
+    overwriting the earlier file), and even second-only precision isn't
+    safe once jobs genuinely run in parallel (agents/orchestrator_agent.py
+    can run several pipelines concurrently via cli.py's `batch` command —
+    two same-company jobs finishing generation in the same second would
+    otherwise collide). A space in the filename is also fragile for
+    shell scripting/globbing."""
     master_name = _slugify(Path(master_tex_path).stem) or "resume"
     company_name = _slugify(jd_analysis.company_name) if jd_analysis and jd_analysis.company_name else "company"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     return f"{master_name}_{company_name}_{timestamp}"
 
 

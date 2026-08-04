@@ -7,8 +7,11 @@ from typing import Optional
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.table import Table
 
 from weave_cv.agents.orchestrator_agent import stream_resume_pipeline
+from weave_cv.batch import BatchFileError, read_job_urls
 from weave_cv.config import CONFIG_PATH, load_config, save_config
 
 load_dotenv()
@@ -249,6 +252,140 @@ def tailor(
     console.print()
     typer.secho(f"Tex saved to: {state['generated_tex_path']}", fg=typer.colors.GREEN)
     typer.secho(f"PDF saved to: {state['generated_pdf_path']}", fg=typer.colors.GREEN)
+
+
+def _short_label(url: str, max_len: int = 57) -> str:
+    return url if len(url) <= max_len else url[: max_len - 3] + "..."
+
+
+async def _run_one_batch_job(
+    url: str, cv_path: str, output_dir: str, semaphore: asyncio.Semaphore,
+    progress: Progress, task_id,
+) -> dict:
+    """Runs one job's full pipeline, updating its own Progress row as it
+    advances through stages — safe to run concurrently with other jobs'
+    calls to this function since each pipeline invocation is independent
+    (see agents/orchestrator_agent.py: no shared mutable state across
+    concurrent .astream() calls, and langchain_mcp_adapters opens a fresh
+    subprocess session per tool/prompt call rather than sharing one)."""
+    label = _short_label(url)
+    final_state: dict = {"job_url": url}
+
+    async with semaphore:
+        progress.update(task_id, description=f"{label} — queued...")
+        try:
+            async for node_name, update in stream_resume_pipeline(url, cv_path, output_dir):
+                final_state.update(update)
+                stage_label = _STAGE_LABELS.get(node_name, node_name)
+
+                if update.get("failed_stage"):
+                    progress.update(
+                        task_id, description=f"[red]✗[/red] {label} — failed at {stage_label}"
+                    )
+                    break
+
+                progress.update(task_id, description=f"{label} — {stage_label}")
+            else:
+                # Loop exhausted without break == every stage succeeded.
+                jd_profile = final_state.get("jd_profile")
+                company = getattr(jd_profile, "company_name", None) if jd_profile else None
+                progress.update(task_id, description=f"[green]✓[/green] {company or label} — done")
+        except Exception as e:
+            final_state["failed_stage"] = "unexpected"
+            final_state["error"] = str(e)
+            progress.update(task_id, description=f"[red]✗[/red] {label} — unexpected error: {e}")
+
+    return final_state
+
+
+async def _run_batch(urls: list[str], cv_path: str, output_dir: str, concurrency: int) -> list[dict]:
+    semaphore = asyncio.Semaphore(concurrency)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task_ids = [progress.add_task(_short_label(url), total=None) for url in urls]
+        return await asyncio.gather(*(
+            _run_one_batch_job(url, cv_path, output_dir, semaphore, progress, task_id)
+            for url, task_id in zip(urls, task_ids)
+        ))
+
+
+def _print_batch_summary(results: list[dict]) -> None:
+    table = Table(title="Batch tailoring summary")
+    table.add_column("Job URL")
+    table.add_column("Status")
+    table.add_column("Output / Error")
+
+    succeeded = 0
+    for r in results:
+        url = r.get("job_url", "?")
+        if r.get("failed_stage"):
+            table.add_row(url, f"[red]failed ({r['failed_stage']})[/red]", str(r.get("error", ""))[:100])
+        else:
+            succeeded += 1
+            table.add_row(url, "[green]done[/green]", r.get("generated_pdf_path", ""))
+
+    console.print()
+    console.print(table)
+    console.print(f"\n{succeeded}/{len(results)} succeeded.")
+
+
+@app.command()
+def batch(
+    file: Path = typer.Option(
+        ...,
+        "--file",
+        "-f",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        help="CSV or XLSX file with a job_url/url/link/job_link header column.",
+    ),
+    cv_path: Path = typer.Option(
+        _cfg.master_resume if _cfg.master_resume else ...,
+        "--master-resume",
+        "-m",
+        prompt=False if _cfg.master_resume else "Enter the path to your master resume .tex file",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        help="Path to your master resume .tex file, reused for every job in the batch. "
+        "Defaults to the saved value (`weave-cv config set --master-resume ...`) if set.",
+    ),
+    output_dir: Path = typer.Option(
+        _cfg.output_dir if _cfg.output_dir else ...,
+        "--output-dir",
+        "-o",
+        prompt=False if _cfg.output_dir else "Enter the folder path to save the generated resume in",
+        help="Folder every generated .tex/.pdf is saved into (created if missing). "
+        "Defaults to the saved value (`weave-cv config set --output-dir ...`) if set.",
+    ),
+    concurrency: int = typer.Option(
+        3, "--concurrency", "-c", min=1,
+        help="Max number of job postings to process in parallel.",
+    ),
+):
+    """Tailor --master-resume against every job URL in --file (one output
+    per job, same output folder), up to --concurrency at a time."""
+    try:
+        urls = read_job_urls(str(file))
+    except BatchFileError as e:
+        typer.secho(str(e), fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    console.print(f"Found {len(urls)} job URL(s) in {file}. Processing up to {concurrency} at a time.\n")
+
+    results = asyncio.run(_run_batch(urls, str(cv_path), str(output_dir), concurrency))
+    _print_batch_summary(results)
+
+    if any(r.get("failed_stage") for r in results):
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":
