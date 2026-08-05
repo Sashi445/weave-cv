@@ -1,7 +1,7 @@
 [project]
 name = "weave-cv"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.1.5"
+description = "An agent that tailors your resume to a job posting — without inventing anything new"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -26,6 +26,11 @@ xai = ["langchain-xai>=1.0.0"]
 deepseek = ["langchain-deepseek>=1.0.0"]
 all = [
     "weave-cv[anthropic,google,groq,xai,deepseek]",
+]
+
+dev = [
+    "build>=1.5.0",
+    "twine>=7.0.0",
 ]
 
 [project.scripts]

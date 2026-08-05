@@ -78,6 +78,7 @@ class PipelineState(PipelineInput, total=False):
 
     generated_tex_path: str
     generated_pdf_path: str
+    generation_attempts: int
 
     failed_stage: str
     error: str
@@ -145,7 +146,9 @@ async def verify(original_cv: CVProfile, tailored_cv: CVProfile) -> Verification
     return VerificationResult(passed=True)
 
 
-async def generate(cv_profile: CVProfile, master_tex_path: str, output_dir: str, jd_analysis: JobDescriptionAnalysis | None) -> tuple[str, str]:
+async def generate(
+    cv_profile: CVProfile, master_tex_path: str, output_dir: str, jd_analysis: JobDescriptionAnalysis | None
+) -> tuple[str, str, int]:
     return await generate_resume(cv_profile, master_tex_path, output_dir, jd_analysis=jd_analysis)
 
 
@@ -203,10 +206,16 @@ async def generate_node(state: PipelineState) -> dict:
     try:
         # cv_path is the master resume's .tex file — its template gets
         # reused by generate_resume(), not just its content.
-        tex_path, pdf_path = await generate(tailored_cv, state["cv_path"], state["output_dir"], jd_analysis=jd_analysis)
+        tex_path, pdf_path, attempts = await generate(
+            tailored_cv, state["cv_path"], state["output_dir"], jd_analysis=jd_analysis
+        )
     except Exception as e:
         return {"failed_stage": "generate", "error": str(e)}
-    return {"generated_tex_path": tex_path, "generated_pdf_path": pdf_path}
+    return {
+        "generated_tex_path": tex_path,
+        "generated_pdf_path": pdf_path,
+        "generation_attempts": attempts,
+    }
 
 
 # --- Graph ------------------------------------------------------------

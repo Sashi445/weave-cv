@@ -2,18 +2,19 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from weave_cv.language_models.index import get_model
 from langchain.agents import create_agent
 from langchain_core.messages import SystemMessage, HumanMessage
+from weave_cv.mcp import mcp_script_path
 from weave_cv.schemas.cv_analysis import CVProfile
 
 client = MultiServerMCPClient({
     "cv_analyzer": {
         "transport": "stdio",
         "command": "python",
-        "args": ["src/weave_cv/mcp/cv_analyzer/index.py"]
+        "args": [mcp_script_path("cv_analyzer", "index.py")]
     },
     "tex_tools": {
         "transport": "stdio",
         "command": "python",
-        "args": ["src/weave_cv/mcp/tex/index.py"]
+        "args": [mcp_script_path("tex", "index.py")]
     }
 })
 

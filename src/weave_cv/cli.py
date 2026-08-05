@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import time
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +19,25 @@ load_dotenv()
 
 app = typer.Typer(help="Tailor a LaTeX resume to a job posting using AI agents.")
 console = Console()
+
+_BANNER = r"""[cyan]  ██╗    ██╗███████╗ █████╗ ██╗   ██╗███████╗     ██████╗██╗   ██╗
+  ██║    ██║██╔════╝██╔══██╗██║   ██║██╔════╝    ██╔════╝██║   ██║
+  ██║ █╗ ██║█████╗  ███████║██║   ██║█████╗      ██║     ██║   ██║
+  ██║███╗██║██╔══╝  ██╔══██║╚██╗ ██╔╝██╔══╝      ██║     ╚██╗ ██╔╝
+  ╚███╔███╔╝███████╗██║  ██║ ╚████╔╝ ███████╗    ╚██████╗ ╚████╔╝
+   ╚══╝╚══╝ ╚══════╝╚═╝  ╚═╝  ╚═══╝  ╚══════╝     ╚═════╝  ╚═══╝ [/cyan]"""
+
+
+def _app_version() -> str:
+    try:
+        return _pkg_version("weave-cv")
+    except PackageNotFoundError:
+        return "dev"
+
+
+def _print_banner() -> None:
+    console.print(_BANNER)
+    console.print(f"[dim]  v{_app_version()}[/dim]\n")
 
 # Loaded once at startup — config values become the *defaults* for
 # tailor's --master-resume/--output-dir flags below, so a CLI flag still
@@ -186,6 +206,10 @@ async def _run_with_progress(job_url: str, cv_path: str, output_dir: str) -> dic
                             f"failed, retrying: {feedback}"
                         )
                         current_label = f"{_STAGE_LABELS['tailor']} (retry)"
+                elif node_name == "generate":
+                    attempts = update.get("generation_attempts")
+                    suffix = f" ({attempts} attempt{'s' if attempts != 1 else ''})" if attempts else ""
+                    console.print(f"[dim]{elapsed:5.1f}s[/dim] [green]✓[/green] {label}{suffix}")
                 else:
                     console.print(f"[dim]{elapsed:5.1f}s[/dim] [green]✓[/green] {label}")
 
@@ -240,6 +264,7 @@ def tailor(
     ),
 ):
     """Tailor --master-resume against --job-url and save the result to --output-dir."""
+    _print_banner()
     state = asyncio.run(_run_with_progress(job_url, str(cv_path), str(output_dir)))
 
     if state.get("failed_stage"):
@@ -373,6 +398,7 @@ def batch(
 ):
     """Tailor --master-resume against every job URL in --file (one output
     per job, same output folder), up to --concurrency at a time."""
+    _print_banner()
     try:
         urls = read_job_urls(str(file))
     except BatchFileError as e:

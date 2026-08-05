@@ -7,6 +7,7 @@ from langchain.messages import SystemMessage, HumanMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from weave_cv.language_models.index import get_model
+from weave_cv.mcp import mcp_script_path
 from weave_cv.schemas.cv_analysis import CVProfile
 from weave_cv.schemas.generation import GeneratedResumeBody
 from weave_cv.schemas.jd_analysis import JobDescriptionAnalysis
@@ -16,7 +17,7 @@ mcp_client = MultiServerMCPClient({
     "resume_generation": {
         "transport": "stdio",
         "command": "python",
-        "args": ["src/weave_cv/mcp/resume_generation.py"]
+        "args": [mcp_script_path("resume_generation.py")]
     }
 })
 
@@ -47,6 +48,91 @@ def _split_preamble_and_body(tex_str: str) -> tuple[str, str]:
     preamble = tex_str[:start]
     body = tex_str[start + len(r"\begin{document}"):end].strip()
     return preamble, body
+
+
+def _strip_comments(text: str) -> str:
+    """Comments (e.g. a "%---- HEADER ----%" section-divider banner) are
+    pure decoration for a human editing the raw .tex source — they never
+    affect the rendered PDF, so there's no reason the generation agent
+    needs to see them in the reference body it's shown. Left in, the
+    model tends to imitate that banner style in its own output to "match
+    the reference," which is exactly the failure mode
+    _escape_latex_specials' docstring already describes: a comment it
+    adds becomes live, uncommented LaTeX once its own unescaped '%' gets
+    escaped downstream by that function. Stripping comments from what
+    the model even sees closes the loophole at the source, instead of
+    only telling it not to reproduce them (still done too, in the
+    prompt, as a second layer — this is the reliable one).
+    """
+    lines = (re.sub(r"(?<!\\)%.*$", "", line) for line in text.splitlines())
+    return "\n".join(lines).strip()
+
+
+# Known tectonic-incompatible preamble patterns, fixed deterministically
+# rather than by asking an LLM to edit the preamble. The preamble is
+# reused byte-for-byte on purpose (see _split_preamble_and_body's
+# docstring) — an LLM "fixing" it risks silently altering packages,
+# margins, or macro definitions the body's \resumeItem{...}-style calls
+# depend on, with no equivalent of the CVProfile stable-ID diff to catch
+# it if it does. This handles the one recurring, well-understood class of
+# preamble breakage instead: pdfTeX-only primitives
+# (\pdfglyphtounicode/\pdfgentounicode, used by many resume templates for
+# copy-paste text fidelity) that tectonic's engine doesn't implement at
+# all, which has now broken two different master resumes in this project
+# the same way. Guarding them is a no-op everywhere else — it only
+# changes behavior on engines that lack these primitives.
+_PREAMBLE_SANITIZERS: list[tuple[re.Pattern, str]] = [
+    (
+        re.compile(r"^\\input\{glyphtounicode\}[ \t]*$", re.MULTILINE),
+        r"\\ifdefined\\pdfgentounicode\\input{glyphtounicode}\\fi",
+    ),
+    (
+        re.compile(r"^\\pdfgentounicode=1[ \t]*$", re.MULTILINE),
+        r"\\ifdefined\\pdfgentounicode\\pdfgentounicode=1\\fi",
+    ),
+]
+
+
+def _sanitize_preamble(preamble: str) -> str:
+    """Applies _PREAMBLE_SANITIZERS. Idempotent — a preamble that's
+    already guarded (or never had the pattern) matches nothing and
+    passes through unchanged, so this is safe to run unconditionally on
+    every call rather than needing a one-time fixup step."""
+    for pattern, replacement in _PREAMBLE_SANITIZERS:
+        preamble = pattern.sub(replacement, preamble)
+    return preamble
+
+
+_TECTONIC_ERROR_LOCATION_RE = re.compile(r"error:\s*([^\s:]+):(\d+):")
+
+
+def _error_is_body_attributable(error_output: str, body_start_line: int) -> bool:
+    """True if a compile error is plausibly something the generation
+    agent's own output caused — i.e. worth spending another attempt (a
+    real LLM call) on. False if it's clearly a preamble/template-level
+    problem instead: an error inside a file the preamble \\input's (e.g.
+    tectonic reports "glyphtounicode:7: ..." — a different file
+    entirely, not the document being compiled), or a line number that
+    falls before the body even starts. Retrying body generation can
+    never fix either case, since the agent never touches the preamble —
+    the exact same error would recur on every attempt.
+
+    Defaults to True (retry) when tectonic's error text doesn't cite a
+    parseable file:line at all — some failure modes (e.g. brace-matching
+    running off the end of the document) don't. Treating "can't tell" as
+    retry-worthy preserves the pre-existing behavior for that case
+    rather than risking giving up early on a genuinely fixable body
+    issue just because its error happened not to include a location.
+    """
+    match = _TECTONIC_ERROR_LOCATION_RE.search(error_output)
+    if not match:
+        return True
+
+    filename, line_str = match.group(1), match.group(2)
+    if filename != "input.tex":
+        return False
+
+    return int(line_str) >= body_start_line
 
 
 def _slugify(text: str) -> str:
@@ -105,46 +191,121 @@ def _escape_latex_specials(text: str) -> str:
     return _UNESCAPED_SPECIAL_RE.sub(lambda m: _LATEX_ESCAPE_MAP[m.group(1)], text)
 
 
+MAX_GENERATION_ATTEMPTS = 3
+
+
+def _build_generation_instruction(
+    cv_profile: CVProfile, reference_body: str, feedback: str | None
+) -> str:
+    instruction = (
+        "Generate a new LaTeX document body for the CVProfile below, "
+        "using the reference body as your formatting/macro guide.\n\n"
+        f"CVProfile:\n{cv_profile.model_dump_json(indent=2)}\n\n"
+        "Reference body (from the master resume template — for "
+        f"formatting/macro style only, its content is not yours to "
+        f"reuse):\n{reference_body}"
+    )
+    if feedback:
+        instruction += (
+            "\n\nYour previous attempt did not compile. This is the real "
+            "compiler error — fix whatever it's pointing at (a stray "
+            "special character, an unbalanced brace, a wrong macro "
+            "argument count, ...) in this attempt:\n"
+            f"{feedback}"
+        )
+    return instruction
+
+
 async def generate_resume(
     cv_profile: CVProfile, master_tex_path: str, output_dir: str,
     jd_analysis: JobDescriptionAnalysis | None
-) -> tuple[str, str]:
+) -> tuple[str, str, int]:
     """Generate a tailored resume from cv_profile, reusing master_tex_path's
     template, and save it as .tex + .pdf in output_dir. Returns
-    (tex_path, pdf_path). output_dir is created if it doesn't exist —
-    where it comes from (CLI flag, prompt, hardcoded test path, ...) is
-    the caller's concern, not this function's or the agent's."""
+    (tex_path, pdf_path, attempts). output_dir is created if it doesn't
+    exist — where it comes from (CLI flag, prompt, hardcoded test path,
+    ...) is the caller's concern, not this function's or the agent's.
+
+    Compilation failure is retried, feeding tectonic's actual error text
+    back to the model as feedback (same pattern as
+    resume_tailor_agent.tailor's feedback param) — most compile failures
+    are the model's own LaTeX mistakes (a stray special character it
+    forgot to escape, a mismatched brace, an accidental comment — see
+    _escape_latex_specials' docstring and the "never write a LaTeX
+    comment" prompt rule for the specific bug class that motivated this),
+    which the model can plausibly fix once it's shown the real error
+    instead of a generic "it didn't work."
+
+    This does NOT retry on a missing/undownloadable tectonic binary
+    (TexServiceImpl._compile_pdf lets that exception propagate rather
+    than folding it into a normal failure) — that's an environment
+    problem, not a content problem, and no amount of LaTeX rewriting
+    fixes it. Retrying would just burn attempts and hide the real cause.
+
+    It also doesn't retry when the compile error is attributable to the
+    preamble rather than the body — see _error_is_body_attributable.
+    Known preamble incompatibilities are sanitized deterministically
+    up front (_sanitize_preamble); anything else that's still a preamble
+    problem fails fast on the first attempt instead of spending
+    MAX_GENERATION_ATTEMPTS worth of LLM calls regenerating a body that
+    was never the cause.
+    """
     with open(master_tex_path, "r", encoding="utf-8") as f:
         master_tex = f.read()
     preamble, reference_body = _split_preamble_and_body(master_tex)
-
-    agent = await make_resume_generation_agent()
-    response = await agent.ainvoke({
-        "messages": [
-            HumanMessage(content=(
-                "Generate a new LaTeX document body for the CVProfile below, "
-                "using the reference body as your formatting/macro guide.\n\n"
-                f"CVProfile:\n{cv_profile.model_dump_json(indent=2)}\n\n"
-                "Reference body (from the master resume template — for "
-                f"formatting/macro style only, its content is not yours to "
-                f"reuse):\n{reference_body}"
-            ))
-        ]
-    })
-
-    generated: GeneratedResumeBody = response["structured_response"]
-    escaped_body = _escape_latex_specials(generated.tex_body)
+    preamble = _sanitize_preamble(preamble)
+    reference_body = _strip_comments(reference_body)
+    body_start_line = preamble.count("\n") + 2  # +1 for \begin{document}'s own line, +1 to 1-index
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    full_tex = f"{preamble}\\begin{{document}}\n{escaped_body}\n\\end{{document}}\n"
-
     filename = _safe_filename(master_tex_path, jd_analysis)
     tex_path = Path(output_dir) / f"{filename}.tex"
-    tex_path.write_text(full_tex, encoding="utf-8")
-
     pdf_path = Path(output_dir) / f"{filename}.pdf"
-    tex_service = TexServiceImpl()
-    if tex_service.tex_to_pdf(tex=full_tex, output_path=str(pdf_path)) is None:
-        raise ValueError("Generated tex failed to compile to PDF.")
 
-    return str(tex_path), str(pdf_path)
+    tex_service = TexServiceImpl()
+    feedback: str | None = None
+    last_error = ""
+    full_tex = ""
+
+    for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
+        agent = await make_resume_generation_agent()
+        instruction = _build_generation_instruction(cv_profile, reference_body, feedback)
+
+        response = await agent.ainvoke({"messages": [HumanMessage(content=instruction)]})
+        generated: GeneratedResumeBody = response["structured_response"]
+        escaped_body = _escape_latex_specials(generated.tex_body)
+        full_tex = f"{preamble}\\begin{{document}}\n{escaped_body}\n\\end{{document}}\n"
+
+        pdf_bytes, error_output = tex_service.tex_to_pdf_with_diagnostics(full_tex, str(pdf_path))
+        if pdf_bytes is not None:
+            tex_path.write_text(full_tex, encoding="utf-8")
+            return str(tex_path), str(pdf_path), attempt
+
+        last_error = error_output
+
+        if not _error_is_body_attributable(error_output, body_start_line):
+            debug_path = Path(output_dir) / f"{filename}.failed.tex"
+            debug_path.write_text(full_tex, encoding="utf-8")
+            raise ValueError(
+                "Generated tex failed to compile because of what looks like a "
+                "preamble/template problem, not the generated body — retrying "
+                "wouldn't help, since the generation agent never touches the "
+                f"preamble. Compiler error:\n{error_output}\n\n"
+                f"The failed attempt was saved to {debug_path} for inspection. "
+                "Check your master resume's preamble (packages, custom "
+                "\\newcommand macros, margins)."
+            )
+
+        feedback = error_output
+
+    # Every attempt failed to compile with a body-attributable error.
+    # Save the last attempt so there's something to actually look at
+    # instead of nothing — the raised error alone doesn't let anyone
+    # inspect the LaTeX that broke.
+    debug_path = Path(output_dir) / f"{filename}.failed.tex"
+    debug_path.write_text(full_tex, encoding="utf-8")
+    raise ValueError(
+        f"Generated tex still failed to compile after {MAX_GENERATION_ATTEMPTS} attempts. "
+        f"Last compiler error:\n{last_error}\n\n"
+        f"The last failed attempt was saved to {debug_path} for inspection."
+    )

@@ -170,18 +170,24 @@ class TexServiceImpl(TexService):
         return "\n".join(lines).strip()
     
     def is_valid_tex(self, tex_str: str) -> bool:
-        success, _ = self._compile_pdf(tex_str)
+        success, _, _ = self._compile_pdf(tex_str)
         return success
 
     def tex_to_pdf(self, tex: str, output_path: str) -> bytes | None:
-        success, pdf_bytes = self._compile_pdf(tex)
+        pdf_bytes, _ = self.tex_to_pdf_with_diagnostics(tex, output_path)
+        return pdf_bytes
+
+    def tex_to_pdf_with_diagnostics(
+        self, tex: str, output_path: str
+    ) -> tuple[bytes | None, str]:
+        success, pdf_bytes, error_output = self._compile_pdf(tex)
         if not success or pdf_bytes is None:
-            return None
+            return None, error_output
 
         out_path = Path(output_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(pdf_bytes)
-        return pdf_bytes
+        return pdf_bytes, ""
 
     def tex_to_docx(self, tex: str, output_path: str) -> bytes | None:
         out_path = Path(output_path)
@@ -202,10 +208,27 @@ class TexServiceImpl(TexService):
         pypandoc.convert_text(tex, to="docx", format="latex", outputfile=str(out_path))
 
     @staticmethod
-    def _compile_pdf(tex_str: str) -> tuple[bool, bytes | None]:
+    def _compile_pdf(tex_str: str) -> tuple[bool, bytes | None, str]:
         """Compiles tex_str with tectonic in a scratch dir and returns
-        (success, pdf_bytes). Shared by is_valid_tex and tex_to_pdf since
-        both need the same compile step, just with different outcomes."""
+        (success, pdf_bytes, error_output). Shared by is_valid_tex and
+        tex_to_pdf(_with_diagnostics) since both need the same compile
+        step, just with different outcomes.
+
+        error_output is tectonic's own stdout+stderr — the actual reason
+        a compile failed (unbalanced braces, undefined control sequence,
+        a missing package, ...), not just a bool. Callers that can act on
+        *why* it failed (e.g. feeding it back to the LLM that generated
+        the tex) need this; a bare True/False throws that information
+        away.
+
+        _tectonic_binary() failures (can't download/locate the binary at
+        all) are deliberately NOT caught here and propagate as a raw
+        exception instead of folding into (False, None, ...) — that's an
+        environment problem (no network, unsupported platform), not a
+        content problem, and retrying with different LaTeX can never fix
+        it. A caller looping on compile failures should let this kind of
+        exception escape the loop rather than burn retries on it.
+        """
         binary = _tectonic_binary()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -220,12 +243,13 @@ class TexServiceImpl(TexService):
                     timeout=60,
                 )
             except subprocess.TimeoutExpired:
-                return False, None
+                return False, None, "tectonic timed out after 60s"
 
             if result.returncode != 0:
-                return False, None
+                output = (result.stdout + result.stderr).decode("utf-8", errors="replace")
+                return False, None, output.strip()
 
-            return True, (tmp_path / "input.pdf").read_bytes()
+            return True, (tmp_path / "input.pdf").read_bytes(), ""
 
 # def update_latex_tree(original_latex: str, target_section: str, new_content: str) -> str:
 #     """Injects a modified string back into its original structural node."""
