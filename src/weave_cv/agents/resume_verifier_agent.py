@@ -2,6 +2,7 @@ from weave_cv.language_models.index import get_model
 from langchain.agents import create_agent
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain.messages import SystemMessage, HumanMessage
+from weave_cv.mcp import mcp_script_path
 from weave_cv.schemas.verification import SemanticVerification
 from weave_cv.services.cv_diff import BulletChange
 
@@ -9,7 +10,7 @@ mcp_client = MultiServerMCPClient({
     "resume_verifier": {
         "transport": "stdio",
         "command": "python",
-        "args": ["src/weave_cv/mcp/resume_verifier.py"]
+        "args": [mcp_script_path("resume_verifier.py")]
     }
 })
 

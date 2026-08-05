@@ -14,10 +14,23 @@ async def _run_crawl(browser_conf: BrowserConfig, run_conf: CrawlerRunConfig, ur
 
 def _install_chromium() -> None:
     """Downloads Playwright's chromium build into its standard per-OS cache
-    dir. A no-op if it's already installed, so safe to call speculatively."""
+    dir. A no-op if it's already installed, so safe to call speculatively.
+
+    This process is an MCP stdio server — its own stdout is the JSON-RPC
+    channel back to the client, not a normal terminal. Without
+    capture_output, the child inherits this process's stdout/stderr file
+    descriptors directly, so playwright's own install progress ("Downloading
+    Chrome for Testing...", percentage bars, ...) gets written straight onto
+    that same JSON-RPC stream and corrupts every message the client tries to
+    parse afterward. capture_output=True redirects both into pipes this
+    process reads instead of inheriting, and — unlike subprocess.DEVNULL —
+    still keeps the output available on .stdout/.stderr if the install ever
+    fails and raises CalledProcessError, instead of silently discarding it.
+    """
     subprocess.run(
         [sys.executable, "-m", "playwright", "install", "chromium"],
         check=True,
+        capture_output=True,
     )
 
 

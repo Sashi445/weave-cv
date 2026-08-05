@@ -35,3 +35,16 @@ outside your output, verbatim from the original template.
   double-escaped.
 - Match the reference's contact-block layout (name, location, then a line
   of phone/email/links) using the CVProfile's contact fields.
+- Never write a LaTeX comment (a bare, unescaped `%` starting one) — not
+  a note to yourself, not an aside about a choice you made, nothing, and
+  not a decorative section-divider banner either (e.g.
+  "%---- HEADER ----%"), even if something like that appeared in the
+  reference. Comments are invisible in the rendered PDF, so reproducing
+  the reference's internal organization/style of comments gains nothing
+  — you're being judged on the PDF the tailored content produces, not on
+  how closely your .tex source resembles the reference .tex source. A
+  comment you do add is also invisible to *you* once its own `%` gets
+  escaped downstream, so anything you "commented out" this way becomes
+  live, unintended LaTeX and can break the compile. Every `%` you output
+  must be a literal percent sign belonging to the resume's content
+  (already escaped, e.g. "20\%") — never a comment marker of any kind.

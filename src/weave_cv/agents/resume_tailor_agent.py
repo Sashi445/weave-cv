@@ -2,6 +2,7 @@ from weave_cv.language_models.index import get_model
 from langchain.agents import create_agent
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain.messages import SystemMessage, HumanMessage
+from weave_cv.mcp import mcp_script_path
 from weave_cv.schemas.cv_analysis import CVProfile
 from weave_cv.schemas.jd_analysis import JobDescriptionAnalysis
 
@@ -9,7 +10,7 @@ mcp_client = MultiServerMCPClient({
     "resume_tailoring": {
         "transport": "stdio",
         "command": "python",
-        "args": ["src/weave_cv/mcp/resume_tailoring.py"]
+        "args": [mcp_script_path("resume_tailoring.py")]
     }
 })
 

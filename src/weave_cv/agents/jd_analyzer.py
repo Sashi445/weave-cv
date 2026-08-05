@@ -9,6 +9,7 @@ from langchain.agents import create_agent
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_core.messages import SystemMessage
 from weave_cv.language_models.index import get_model
+from weave_cv.mcp import mcp_script_path
 from weave_cv.schemas.jd_analysis import JobDescriptionAnalysis
 import asyncio
 
@@ -17,12 +18,12 @@ mcp_client = MultiServerMCPClient(
         "web_scrape": {
             "transport": "stdio",
             "command": "python",
-            "args": ["src/weave_cv/mcp/web_scrape/index.py"]
+            "args": [mcp_script_path("web_scrape", "index.py")]
         },
         "jd_analyzer": {
             "transport": "stdio",
             "command": "python",
-            "args": ["src/weave_cv/mcp/jd_analyzer/index.py"]
+            "args": [mcp_script_path("jd_analyzer", "index.py")]
         }
     }
 )
