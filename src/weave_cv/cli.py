@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import sys
 import time
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
@@ -414,5 +415,15 @@ def batch(
         raise typer.Exit(code=1)
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point (see [project.scripts] in pyproject.toml). Click's
+    --help is an eager option that exits before any command callback
+    runs, so `tailor`/`batch`'s own `_print_banner()` calls never fire
+    for --help — print it here instead, ahead of handing off to `app`."""
+    if len(sys.argv) == 1 or "--help" in sys.argv or "-h" in sys.argv:
+        _print_banner()
     app()
+
+
+if __name__ == "__main__":
+    main()
