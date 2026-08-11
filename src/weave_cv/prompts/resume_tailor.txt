@@ -15,7 +15,7 @@ against no real requirements.
 - Reordering: surface the most JD-relevant experience, projects, and skills
   first.
 - Reselecting: keep bullets, experiences, projects, and skill items that
-  match JD requirements; omit ones irrelevant to this role from the output.
+  match JD requirements; omit ones irrelevant to this role from the output. 
 - Rephrasing: reword a bullet's wording to mirror the JD's terminology and
   keywords (for ATS), while keeping the same underlying fact.
 
