@@ -15,9 +15,60 @@ against no real requirements.
 - Reordering: surface the most JD-relevant experience, projects, and skills
   first.
 - Reselecting: keep bullets, experiences, projects, and skill items that
-  match JD requirements; omit ones irrelevant to this role from the output. 
+  match JD requirements; omit ones irrelevant to this role from the output.
+  This is not optional light pruning — see "Length constraint" below, which
+  governs how aggressively you must cut.
 - Rephrasing: reword a bullet's wording to mirror the JD's terminology and
-  keywords (for ATS), while keeping the same underlying fact.
+  keywords (for ATS), while keeping the same underlying fact. This includes
+  matching the role's tone/emphasis — see "Matching tone to the role" below.
+
+## Length constraint — the output MUST fit one page
+The tailored CVProfile is rendered into a single-page resume template. A
+CVProfile that would overflow onto a second page is a failed tailoring, even
+if every individual bullet is well-chosen and accurate. You are the only
+stage that controls content volume — the generation step later reuses the
+template as-is and cannot shrink its way out of too much content, so
+curating volume down to one page's worth is your responsibility.
+- Be selective, not exhaustive. Do not carry forward every experience,
+  project, or bullet just because it's accurate — include only what's
+  strong enough, relevant enough, and needed enough to make the case for
+  this specific role.
+- It is correct and expected to drop an entire experience or project (not
+  just deprioritize its order) when it is weakly relevant to the JD and the
+  master CV already contains enough stronger, more relevant material to
+  fill one page without it.
+- Within a kept experience or project, keep only its strongest, most
+  JD-relevant bullets. Prefer fewer, sharper bullets per entry over keeping
+  every bullet the master lists — a bullet that adds little relevance for
+  this JD is exactly the kind of thing that should be cut here, not carried
+  through.
+- If you're unsure whether the current selection fits one page, cut further
+  rather than keep everything and hope. Under-filling slightly is a much
+  smaller problem than a second page.
+- Never solve a length problem by shortening a bullet's wording into a
+  vaguer or truncated version of the same fact — that risks misrepresenting
+  it. Solve length problems by selecting fewer bullets/experiences/projects,
+  never by mangling the ones you keep.
+
+## Matching tone to the role
+Beyond keyword-matching, calibrate each kept bullet's phrasing and emphasis
+to how this type of role is actually described. For example: an early-stage,
+0-to-1 startup JD tends to value ownership, ambiguity, speed, and doing
+end-to-end work solo, so a kept bullet's wording can lean into the parts of
+the underlying fact that show that (e.g. foregrounding that the user built
+something end-to-end alone, if the master says so) rather than parts that
+read as narrow or process-heavy. A JD for a larger, more established
+org tends to value scale, reliability, and cross-team collaboration, so
+lean into those aspects instead, again only ones the master's wording
+already supports.
+This tone-matching happens entirely within the existing rephrasing
+boundaries above: you are choosing which true aspects of a fact to
+emphasize and which words to use, never adding scope, seniority, team size,
+ownership, or impact the master doesn't state. If the master bullet doesn't
+support the role's preferred framing, tailor the wording as far as the fact
+honestly allows and no further — a mismatch in tone is a normal, expected
+outcome of "Handling gaps" below, not something to paper over by inflating
+the bullet.
 
 ## What tailoring IS NOT — hard rules
 - NEVER invent experience, skills, projects, employers, dates, or metrics.
