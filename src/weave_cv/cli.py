@@ -15,6 +15,7 @@ from rich.table import Table
 from weave_cv.agents.orchestrator_agent import stream_resume_pipeline
 from weave_cv.batch import BatchFileError, read_job_urls
 from weave_cv.config import CONFIG_PATH, load_config, save_config
+from weave_cv.services import cv_cache, jd_cache
 
 load_dotenv()
 
@@ -140,6 +141,124 @@ def config_show():
     for key, value in fields.items():
         shown = value if value is not None else "[dim](not set)[/dim]"
         console.print(f"{key}: {shown}")
+
+
+cache_app = typer.Typer(help="Manage weave-cv's cached CV analyses.")
+app.add_typer(cache_app, name="cache")
+
+
+@cache_app.command("clear")
+def cache_clear():
+    """Delete every cached CV analysis and JD analysis, forcing a fresh
+    re-analysis of the master resume and/or job posting on the next
+    `tailor`/`batch` run regardless of whether either actually changed.
+    Useful after a prompt/model change you want reflected immediately."""
+    cv_removed = cv_cache.clear_cache()
+    jd_removed = jd_cache.clear_cache()
+    if cv_removed == 0 and jd_removed == 0:
+        typer.secho("Cache was already empty.", fg=typer.colors.YELLOW)
+    else:
+        typer.secho(
+            f"Cleared {cv_removed} cached CV analysis file(s) and "
+            f"{jd_removed} cached JD analysis file(s).",
+            fg=typer.colors.GREEN,
+        )
+
+
+@cache_app.command("show")
+def cache_show(
+    master_resume: Optional[Path] = typer.Option(
+        None,
+        "--master-resume",
+        "-m",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        help="Master resume .tex file to check. Defaults to the saved config value.",
+    ),
+    job_url: Optional[str] = typer.Option(
+        None, "--job-url", "-j", help="Job posting URL to check."
+    ),
+):
+    """Report whether --master-resume (or the saved default) and/or
+    --job-url currently have a cached analysis, plus a summary of
+    everything in both caches."""
+    cv_path = master_resume or (Path(_cfg.master_resume) if _cfg.master_resume else None)
+
+    if cv_path is None:
+        typer.secho(
+            "No master resume given or configured — see `weave-cv config set --master-resume ...`.",
+            fg=typer.colors.YELLOW,
+        )
+    else:
+        entry = cv_cache.get_cache_entry(str(cv_path))
+        if entry is None:
+            typer.secho(f"Not cached (CV): {cv_path}", fg=typer.colors.YELLOW)
+        else:
+            typer.secho(f"Cached (CV): {cv_path}", fg=typer.colors.GREEN)
+            console.print(f"  name: {entry.contact_name or '[dim](none)[/dim]'}")
+            console.print(f"  cached at: {entry.cached_at:%Y-%m-%d %H:%M:%S}")
+
+    console.print()
+
+    if job_url is None:
+        console.print("[dim]Pass --job-url to check a specific job posting's cache status.[/dim]")
+    else:
+        entry = jd_cache.get_cache_entry(job_url)
+        if entry is None:
+            typer.secho(f"Not cached (JD): {job_url}", fg=typer.colors.YELLOW)
+        elif entry.expired:
+            typer.secho(f"Expired (JD): {job_url}", fg=typer.colors.YELLOW)
+            console.print(f"  cached at: {entry.cached_at:%Y-%m-%d %H:%M:%S} (TTL: {jd_cache.JD_CACHE_TTL})")
+        else:
+            typer.secho(f"Cached (JD): {job_url}", fg=typer.colors.GREEN)
+            console.print(f"  company: {entry.company_name or '[dim](none)[/dim]'}")
+            console.print(f"  title: {entry.title or '[dim](none)[/dim]'}")
+            console.print(f"  cached at: {entry.cached_at:%Y-%m-%d %H:%M:%S}")
+
+    console.print()
+
+    cv_entries = cv_cache.list_cache_entries()
+    if cv_entries:
+        table = Table(title=f"All cached CV analyses ({len(cv_entries)})")
+        table.add_column("Hash")
+        table.add_column("Name")
+        table.add_column("Cached At")
+        table.add_column("Size")
+        for e in cv_entries:
+            table.add_row(
+                e.hash[:12],
+                e.contact_name or "[dim](none)[/dim]",
+                f"{e.cached_at:%Y-%m-%d %H:%M:%S}",
+                f"{e.size_bytes:,} B",
+            )
+        console.print(table)
+    else:
+        console.print("[dim]No cached CV analyses.[/dim]")
+
+    console.print()
+
+    jd_entries = jd_cache.list_cache_entries()
+    if jd_entries:
+        table = Table(title=f"All cached JD analyses ({len(jd_entries)})")
+        table.add_column("Hash")
+        table.add_column("Company")
+        table.add_column("Title")
+        table.add_column("Cached At")
+        table.add_column("Status")
+        for e in jd_entries:
+            status = "[yellow]expired[/yellow]" if e.expired else "[green]fresh[/green]"
+            table.add_row(
+                e.hash[:12],
+                e.company_name or "[dim](none)[/dim]",
+                e.title or "[dim](none)[/dim]",
+                f"{e.cached_at:%Y-%m-%d %H:%M:%S}",
+                status,
+            )
+        console.print(table)
+    else:
+        console.print("[dim]No cached JD analyses.[/dim]")
 
 
 _STAGE_LABELS = {

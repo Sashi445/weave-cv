@@ -26,13 +26,15 @@ from langchain.messages import HumanMessage
 from langgraph.graph import StateGraph, START, END
 
 from weave_cv.agents.cv_analyzer import make_cv_analyzer_agent
-from weave_cv.agents.jd_analyzer import make_jd_analyzer_agent
+from weave_cv.agents.jd_analyzer import analyze_job_posting
 from weave_cv.agents.resume_tailor_agent import tailor
 from weave_cv.agents.resume_verifier_agent import check_reworded_bullets
 from weave_cv.agents.resume_generation_agent import generate_resume
 from weave_cv.schemas.cv_analysis import CVProfile
 from weave_cv.schemas.jd_analysis import JobDescriptionAnalysis
+from weave_cv.services.cv_cache import get_cached_cv_profile, save_cv_profile_to_cache
 from weave_cv.services.cv_diff import diff_cv_profiles
+from weave_cv.services.jd_cache import get_cached_jd_profile, save_jd_profile_to_cache
 
 MAX_VERIFICATION_ATTEMPTS = 3
 
@@ -86,6 +88,44 @@ class PipelineState(PipelineInput, total=False):
 
 # --- Stages -----------------------------------------------------------
 
+async def _analyze_jd(job_url: str) -> JobDescriptionAnalysis:
+    """Cache-first, keyed on job_url with a TTL (see services/jd_cache.py)
+    — unlike the CV cache, a job posting isn't a file the user controls,
+    so a hit isn't trusted forever. A hit skips both the scrape (a real
+    latency cost of its own) and the LLM extraction call; only a miss
+    pays for either."""
+    cached = get_cached_jd_profile(job_url)
+    if cached is not None:
+        return cached
+
+    profile = await analyze_job_posting(job_url)
+    save_jd_profile_to_cache(job_url, profile)
+    return profile
+
+
+async def _analyze_cv(cv_path: str) -> CVProfile:
+    """Cache-first: the master resume rarely changes between runs, so a
+    cache hit (keyed on the file's content hash — see services/cv_cache.py)
+    skips both the agent-construction MCP round trip and the LLM call
+    entirely, returning the previously extracted CVProfile as-is. Only a
+    cache miss pays for a real analysis, whose result is then cached for
+    next time.
+    """
+    cached = get_cached_cv_profile(cv_path)
+    if cached is not None:
+        return cached
+
+    agent = await make_cv_analyzer_agent()
+    result = await agent.ainvoke({
+        "messages": [
+            HumanMessage(content=f"Analyze my resume located at '{cv_path}'")
+        ]
+    })
+    profile = result["structured_response"]
+    save_cv_profile_to_cache(cv_path, profile)
+    return profile
+
+
 async def gather_inputs(
     job_url: str, cv_path: str
 ) -> tuple[JobDescriptionAnalysis, CVProfile]:
@@ -93,21 +133,9 @@ async def gather_inputs(
     depend on each other, so there's no reason for one to wait on the
     other (see the parallel-tool-calling discussion for why this is done
     in code rather than left to an LLM to decide to batch)."""
-    jd_agent, cv_agent = await asyncio.gather(
-        make_jd_analyzer_agent(),
-        make_cv_analyzer_agent(),
-    )
     jd_result, cv_result = await asyncio.gather(
-        jd_agent.ainvoke({
-            "messages": [
-                HumanMessage(content=f"Analyze this job posting for me - '{job_url}'")
-            ]
-        }),
-        cv_agent.ainvoke({
-            "messages": [
-                HumanMessage(content=f"Analyze my resume located at '{cv_path}'")
-            ]
-        }),
+        _analyze_jd(job_url),
+        _analyze_cv(cv_path),
         return_exceptions=True,
     )
 
@@ -121,7 +149,7 @@ async def gather_inputs(
 
     assert not isinstance(jd_result, BaseException)
     assert not isinstance(cv_result, BaseException)
-    return jd_result["structured_response"], cv_result["structured_response"]
+    return jd_result, cv_result
 
 
 async def verify(original_cv: CVProfile, tailored_cv: CVProfile) -> VerificationResult:

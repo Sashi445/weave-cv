@@ -81,6 +81,18 @@ def _strip_comments(text: str) -> str:
 # all, which has now broken two different master resumes in this project
 # the same way. Guarding them is a no-op everywhere else — it only
 # changes behavior on engines that lack these primitives.
+#
+# fontawesome5's icon fonts crash tectonic's XeTeX engine outright
+# (SIGABRT) merely on \usepackage, before any \fa... glyph is even used —
+# not a recoverable LaTeX error, so there's no compiler message to retry
+# against. The legacy fontawesome (v4) package renders the same common
+# icon names (\faPhone, \faEnvelope, \faLinkedin, \faGithub, ...) without
+# tripping the crash, so swapping the package is a safe substitution:
+# fontawesome5 never compiles under tectonic regardless, so there's no
+# working behavior this could regress. A master resume using a
+# v5-only icon absent from v4 will surface as an ordinary "Undefined
+# control sequence" on retry instead of an unrecoverable crash — strictly
+# more actionable than today's outcome either way.
 _PREAMBLE_SANITIZERS: list[tuple[re.Pattern, str]] = [
     (
         re.compile(r"^\\input\{glyphtounicode\}[ \t]*$", re.MULTILINE),
@@ -89,6 +101,10 @@ _PREAMBLE_SANITIZERS: list[tuple[re.Pattern, str]] = [
     (
         re.compile(r"^\\pdfgentounicode=1[ \t]*$", re.MULTILINE),
         r"\\ifdefined\\pdfgentounicode\\pdfgentounicode=1\\fi",
+    ),
+    (
+        re.compile(r"\\usepackage(\[[^\]]*\])?\{fontawesome5\}"),
+        r"\\usepackage{fontawesome}",
     ),
 ]
 
