@@ -1,6 +1,6 @@
 [project]
 name = "weave-cv"
-version = "0.1.7"
+version = "0.1.8"
 description = "An agent that tailors your resume to a job posting — without inventing anything new"
 readme = "README.md"
 requires-python = ">=3.12"
