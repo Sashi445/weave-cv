@@ -1,5 +1,5 @@
 from weave_cv.agents.cv_analyzer import make_cv_analyzer_agent
-from weave_cv.agents.jd_analyzer import make_jd_analyzer_agent
+from weave_cv.agents.jd_analyzer import analyze_job_posting
 from weave_cv.agents.resume_tailor_agent import tailor
 from weave_cv.agents.orchestrator_agent import gather_inputs, run_resume_pipeline, stream_resume_pipeline
 from dotenv import load_dotenv
@@ -27,14 +27,12 @@ async def test_cv_analyzer_agent():
     pprint(response["messages"][-1].content)
 
 async def test_jd_analyzer_agent():
-    jd_analyzer_agent = await make_jd_analyzer_agent()
-    response = await jd_analyzer_agent.ainvoke({
-        "messages": [
-            HumanMessage(
-                content="Analyze this job posting for me - 'https://job-boards.greenhouse.io/tailscale/jobs/4710703005' "
-            )
-        ]
-    })
+    response = await analyze_job_posting(
+        "https://job-boards.greenhouse.io/tailscale/jobs/4710703005"
+    )
+
+    from pprint import pprint
+    pprint(response)
 
 def print_cv_profile_delta(original: CVProfile, tailored: CVProfile) -> None:
     """Print a structural diff between an original and tailored CVProfile.
