@@ -11,6 +11,7 @@ config.toml's ~/.weave-cv/ convention (see config.py).
 """
 
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,18 @@ from weave_cv.config import CONFIG_DIR
 from weave_cv.schemas.cv_analysis import CVProfile
 
 CACHE_DIR = CONFIG_DIR / "cache" / "cv_analysis"
+
+# Bump whenever CVProfile gains a field the analyzer should be extracting
+# (not a purely derived/default one) — a cached entry written under an
+# older version is treated as a miss rather than served as-is. Without
+# this, adding e.g. Project.links validates fine against an old cache
+# entry that predates the field (default_factory=list silently fills it
+# in as empty) — the entry looks "valid" but was never actually asked to
+# extract that data, so it would keep serving links-less profiles forever
+# regardless of any extraction-prompt fix, with no error and no signal
+# that anything's wrong. A version mismatch forces one re-extraction per
+# stale entry instead.
+CACHE_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -36,12 +49,30 @@ def _hash_file(cv_path: str) -> str:
     return hashlib.sha256(Path(cv_path).read_bytes()).hexdigest()
 
 
-def _read_entry(cache_path: Path) -> CacheEntry | None:
+def _read_versioned_profile(cache_path: Path) -> CVProfile | None:
+    """None on a cache miss, an unreadable/corrupt entry, OR a
+    schema-version mismatch — all three are just "can't trust this,
+    re-extract" to every caller, never a crash over what's only a
+    performance optimization. A version mismatch also covers every
+    pre-versioning entry (the raw-CVProfile-JSON format this replaced),
+    since those have no `schema_version` key to match at all."""
     if not cache_path.exists():
         return None
     try:
-        profile = CVProfile.model_validate_json(cache_path.read_text(encoding="utf-8"))
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
     except (ValueError, OSError):
+        return None
+    if not isinstance(raw, dict) or raw.get("schema_version") != CACHE_SCHEMA_VERSION:
+        return None
+    try:
+        return CVProfile.model_validate(raw["profile"])
+    except (ValueError, KeyError):
+        return None
+
+
+def _read_entry(cache_path: Path) -> CacheEntry | None:
+    profile = _read_versioned_profile(cache_path)
+    if profile is None:
         return None
     stat = cache_path.stat()
     return CacheEntry(
@@ -53,22 +84,17 @@ def _read_entry(cache_path: Path) -> CacheEntry | None:
 
 
 def get_cached_cv_profile(cv_path: str) -> CVProfile | None:
-    """None on any cache miss or unreadable/corrupt cache entry — a bad
-    cache file should fall back to re-running analysis, never crash the
-    pipeline over what's just a performance optimization."""
+    """None on any cache miss, unreadable/corrupt entry, or version
+    mismatch — see _read_versioned_profile."""
     cache_path = CACHE_DIR / f"{_hash_file(cv_path)}.json"
-    if not cache_path.exists():
-        return None
-    try:
-        return CVProfile.model_validate_json(cache_path.read_text(encoding="utf-8"))
-    except (ValueError, OSError):
-        return None
+    return _read_versioned_profile(cache_path)
 
 
 def save_cv_profile_to_cache(cv_path: str, profile: CVProfile) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = CACHE_DIR / f"{_hash_file(cv_path)}.json"
-    cache_path.write_text(profile.model_dump_json(indent=2), encoding="utf-8")
+    payload = {"schema_version": CACHE_SCHEMA_VERSION, "profile": profile.model_dump(mode="json")}
+    cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def get_cache_entry(cv_path: str) -> CacheEntry | None:

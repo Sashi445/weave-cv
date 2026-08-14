@@ -58,6 +58,14 @@ class Project(BaseModel):
     technologies: list[str] = Field(
         default_factory=list, description="Verbatim, not expanded."
     )
+    links: list[Link] = Field(
+        default_factory=list,
+        description="URLs associated with this project (e.g. a GitHub repo "
+        "or live demo), each with a display label — same shape as "
+        "Contact.links. Extracted from any \\href{url}{label} (or bare "
+        "URL) tied to this project in the source resume. Never invent one; "
+        "never drop one that exists.",
+    )
     bullets: list[Bullet] = Field(default_factory=list)
 
 

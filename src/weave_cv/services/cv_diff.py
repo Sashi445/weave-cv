@@ -218,7 +218,7 @@ def diff_cv_profiles(original: CVProfile, tailored: CVProfile) -> CVProfileDiff:
         ),
         projects=_diff_entries(
             original.projects, tailored.projects, "Projects",
-            fact_fields=["name", "description", "technologies"],
+            fact_fields=["name", "description", "technologies", "links"],
         ),
         skills=_diff_flat_list(orig_skills, tail_skills, "Skills"),
         certifications=_diff_flat_list(original.certifications, tailored.certifications, "Certifications"),

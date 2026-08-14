@@ -1,5 +1,5 @@
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from weave_cv.language_models.index import get_model
+from weave_cv.language_models.index import cacheable_system_message, get_model
 from langchain.agents import create_agent
 from langchain_core.messages import SystemMessage, HumanMessage
 from weave_cv.mcp import mcp_script_path
@@ -21,7 +21,7 @@ client = MultiServerMCPClient({
 
 async def _get_prompt_and_tools():
     prompt_data = await client.get_prompt("cv_analyzer", "system_prompt")
-    prompt = SystemMessage(content=prompt_data[0].content)
+    prompt = cacheable_system_message(prompt_data[0].content)
 
     all_tools = await client.get_tools(server_name="tex_tools")
     tools = [t for t in all_tools if t.name == "parse_tex_as_text"]
