@@ -8,7 +8,7 @@
 from langchain.agents import create_agent
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_core.messages import SystemMessage, HumanMessage
-from weave_cv.language_models.index import get_model
+from weave_cv.language_models.index import cacheable_system_message, get_model
 from weave_cv.mcp import mcp_script_path
 from weave_cv.schemas.jd_analysis import JobDescriptionAnalysis
 from weave_cv.services.web_scraper import scrape_url
@@ -25,7 +25,7 @@ mcp_client = MultiServerMCPClient(
 
 async def _get_prompt() -> SystemMessage:
     prompt = await mcp_client.get_prompt("jd_analyzer", "prompt")
-    return SystemMessage(content=prompt[0].content)
+    return cacheable_system_message(prompt[0].content)
 
 async def make_jd_analyzer_agent():
     prompt = await _get_prompt()

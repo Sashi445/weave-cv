@@ -2,6 +2,7 @@ import os
 
 import typer
 from langchain.chat_models import init_chat_model
+from langchain.messages import SystemMessage
 from dotenv import find_dotenv, load_dotenv
 
 from weave_cv.config import load_config, save_config
@@ -88,6 +89,42 @@ def _resolve_model_name(cfg, provider: str) -> str:
     save_config(cfg)
     typer.secho("Saved model to your weave-cv config.", fg=typer.colors.GREEN)
     return entered
+
+
+def get_provider() -> str:
+    """The configured provider string alone, without the model-name/API-key
+    resolution get_model() also does — callers that only need to branch on
+    *which* backend is active (e.g. cacheable_system_message below) would
+    otherwise trigger an interactive credential prompt just to find out.
+    Safe to call anywhere, including at import time."""
+    cfg = load_config()
+    return cfg.provider or _DEFAULT_PROVIDER
+
+
+def cacheable_system_message(text: str | list[str | dict]) -> SystemMessage:
+    """Every agent in this project (tailor, generate, verify, cv_analyzer,
+    jd_analyzer) sends the same static system prompt on every call, and
+    several of them now call themselves in a retry loop (tailor's
+    verify-failure and page-fit retries; generate's own compile-error and
+    overflow retries) — resending that full prompt at full price on every
+    retry is exactly where token cost was piling up.
+
+    OpenAI and DeepSeek already cache a repeated prompt prefix
+    automatically server-side, no code changes needed. Anthropic requires
+    an explicit `cache_control` breakpoint per request instead, so this
+    only changes behavior for provider == "anthropic" — every other
+    provider gets the same plain SystemMessage as before, since marking a
+    breakpoint they don't understand risks a rejected request for no
+    benefit. Every prompt this project loads is a plain string from a
+    static .txt file in practice (`text: str` below), but an MCP prompt
+    message's content is typed more broadly than that — a non-str value
+    is passed through uncached rather than assumed to be safe to wrap in
+    a single text block."""
+    if get_provider() == "anthropic" and isinstance(text, str):
+        return SystemMessage(
+            content=[{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+        )
+    return SystemMessage(content=text)
 
 
 def get_model():

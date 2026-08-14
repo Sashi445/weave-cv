@@ -11,3 +11,15 @@ summarizing, or dropping anything.
 - Never drop a section: anything that doesn't fit the standard fields goes
   into `additional`, preserved verbatim.
 - Do not summarize bullets down — preserve full original wording.
+- For each project, capture EVERY link tied to it — this is non-negotiable,
+  never skip one. Common patterns to catch: a `\href{url}{...}` wrapping a
+  small icon next to the heading, a `\href{url}{...}` wrapping the entire
+  project name/heading (the href IS the project entry, common in
+  single-column templates), a separate "GitHub"/"Demo" text link, or a
+  bare URL in the description/bullets. Derive a short, clean label from
+  the URL's own domain/purpose (e.g. "GitHub" for a github.com URL, "Demo"
+  for a live-site link, "PyPI" for a pypi.org URL) rather than reusing the
+  href's visible text verbatim when that text is the whole project
+  heading/description — a label should identify what kind of link it is,
+  not duplicate content already in `name`/`description`. Never invent a
+  URL, and never drop a project's link just because it's awkward to label.

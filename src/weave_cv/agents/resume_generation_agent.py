@@ -1,12 +1,17 @@
+import io
 import re
+import tempfile
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 from langchain.agents import create_agent
 from langchain.messages import SystemMessage, HumanMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from pypdf import PdfReader
 
-from weave_cv.language_models.index import get_model
+from weave_cv.agents.cover_letter_agent import generate_cover_letter
+from weave_cv.language_models.index import cacheable_system_message, get_model
 from weave_cv.mcp import mcp_script_path
 from weave_cv.schemas.cv_analysis import CVProfile
 from weave_cv.schemas.generation import GeneratedResumeBody
@@ -24,7 +29,7 @@ mcp_client = MultiServerMCPClient({
 
 async def _get_prompt() -> SystemMessage:
     prompt = await mcp_client.get_prompt("resume_generation", "prompt")
-    return SystemMessage(content=prompt[0].content)
+    return cacheable_system_message(prompt[0].content)
 
 
 async def make_resume_generation_agent():
@@ -155,23 +160,20 @@ def _slugify(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_")
 
 
-def _safe_filename(master_tex_path: str, jd_analysis: JobDescriptionAnalysis | None) -> str:
-    """master_resume_name + company_name + timestamp. Uses the master
-    .tex file's own name, not the CVProfile's contact.name — the file
-    naming is about which template/run produced this output, not who the
-    resume belongs to. Timestamp is full date+time with microseconds
-    (not date-only, not second-only) and has no spaces: a date-only name
-    collides on same-day reruns against the same company (silently
-    overwriting the earlier file), and even second-only precision isn't
-    safe once jobs genuinely run in parallel (agents/orchestrator_agent.py
-    can run several pipelines concurrently via cli.py's `batch` command —
-    two same-company jobs finishing generation in the same second would
-    otherwise collide). A space in the filename is also fragile for
-    shell scripting/globbing."""
-    master_name = _slugify(Path(master_tex_path).stem) or "resume"
+def _output_subdir_name(jd_analysis: JobDescriptionAnalysis | None) -> str:
+    """"<company name> - <timestamp>" — every generation run gets its own
+    subfolder under output_dir, named by company rather than by master
+    template, since the resume naturally belongs with its job.  Timestamp
+    keeps microsecond precision even though only date+time is shown in
+    spirit: a date-only name collides on same-day reruns against the same
+    company (silently overwriting the earlier folder), and even
+    second-only precision isn't safe once jobs genuinely run in parallel
+    (agents/orchestrator_agent.py can run several pipelines concurrently
+    via cli.py's `batch` command — two same-company jobs finishing
+    generation in the same second would otherwise collide)."""
     company_name = _slugify(jd_analysis.company_name) if jd_analysis and jd_analysis.company_name else "company"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    return f"{master_name}_{company_name}_{timestamp}"
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    return f"{company_name} - {timestamp}"
 
 
 _LATEX_ESCAPE_MAP = {
@@ -208,10 +210,76 @@ def _escape_latex_specials(text: str) -> str:
 
 
 MAX_GENERATION_ATTEMPTS = 3
+TARGET_PAGE_COUNT = 1
+
+# A tailored resume rendering below this fraction of the master template's
+# own word count (see _reference_word_count) is treated as under-filled —
+# tailor cut more than the page actually needed, leaving trailing
+# whitespace instead of using the page. Only tailor can fix this (it has
+# the content generate never sees), so this doesn't get a local retry
+# here — see GenerationResult.underfilled and orchestrator_agent's
+# generate->tailor edge.
+MIN_FILL_RATIO = 0.85
+
+
+@dataclass
+class GenerationResult:
+    tex_path: str
+    pdf_path: str
+    attempts: int
+    underfilled: bool = False
+    fill_feedback: str = ""
+    cover_letter_path: str | None = None
+
+
+def _word_count(pdf_bytes: bytes) -> int:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text = " ".join(page.extract_text() or "" for page in reader.pages)
+    return len(text.split())
+
+
+def _reference_word_count(tex_service: TexServiceImpl, preamble: str, reference_body: str) -> int | None:
+    """Compiles the master template's own, untouched content (through the
+    same sanitized preamble used for every tailored attempt) purely to
+    measure how many words this specific template/font/margin combo holds
+    on one page — the master resume is presumably already tuned to fill
+    it, so its own rendered word count is a better fullness target than
+    any fixed number would be across different templates. Returns None if
+    that reference compile fails for any reason, so callers can skip the
+    under-fill check entirely rather than compare against a bogus number.
+    """
+    reference_tex = f"{preamble}\\begin{{document}}\n{reference_body}\n\\end{{document}}\n"
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        pdf_bytes, _ = tex_service.tex_to_pdf_with_diagnostics(
+            reference_tex, str(Path(tmp_dir) / "reference.pdf")
+        )
+    return _word_count(pdf_bytes) if pdf_bytes is not None else None
+
+
+async def _write_cover_letter(
+    cv_profile: CVProfile, jd_analysis: JobDescriptionAnalysis | None, run_dir: Path
+) -> str | None:
+    """Best-effort: a cover letter is a bonus artifact alongside the
+    resume, not the resume itself, so a failure here (LLM error, missing
+    JD context) must never take down an otherwise-successful resume
+    generation. Returns None — silently — on either "can't" (no
+    jd_analysis to write about) or "failed", same as any other skip."""
+    if jd_analysis is None:
+        return None
+    try:
+        content = await generate_cover_letter(cv_profile, jd_analysis)
+    except Exception:
+        return None
+    cover_letter_path = run_dir / "cover_letter.txt"
+    cover_letter_path.write_text(content, encoding="utf-8")
+    return str(cover_letter_path)
 
 
 def _build_generation_instruction(
-    cv_profile: CVProfile, reference_body: str, feedback: str | None
+    cv_profile: CVProfile,
+    reference_body: str,
+    compile_error: str | None,
+    overflow_page_count: int | None,
 ) -> str:
     instruction = (
         "Generate a new LaTeX document body for the CVProfile below, "
@@ -221,13 +289,25 @@ def _build_generation_instruction(
         f"formatting/macro style only, its content is not yours to "
         f"reuse):\n{reference_body}"
     )
-    if feedback:
+    if compile_error:
         instruction += (
             "\n\nYour previous attempt did not compile. This is the real "
             "compiler error — fix whatever it's pointing at (a stray "
             "special character, an unbalanced brace, a wrong macro "
             "argument count, ...) in this attempt:\n"
-            f"{feedback}"
+            f"{compile_error}"
+        )
+    elif overflow_page_count is not None:
+        instruction += (
+            "\n\nYour previous attempt compiled but rendered to "
+            f"{overflow_page_count} pages; the target is exactly "
+            f"{TARGET_PAGE_COUNT} page. Fix this in order: (1) tighten "
+            "vertical spacing/margins using the reference template's own "
+            "macros, if it exposes any for that; (2) if that alone isn't "
+            "enough, shorten the wording of the least JD-relevant bullets "
+            "while preserving every fact and metric they state. Do not "
+            "remove a bullet's underlying claim, invent content, or drop "
+            "an entire role or section just to save space."
         )
     return instruction
 
@@ -235,12 +315,12 @@ def _build_generation_instruction(
 async def generate_resume(
     cv_profile: CVProfile, master_tex_path: str, output_dir: str,
     jd_analysis: JobDescriptionAnalysis | None
-) -> tuple[str, str, int]:
+) -> GenerationResult:
     """Generate a tailored resume from cv_profile, reusing master_tex_path's
-    template, and save it as .tex + .pdf in output_dir. Returns
-    (tex_path, pdf_path, attempts). output_dir is created if it doesn't
-    exist — where it comes from (CLI flag, prompt, hardcoded test path,
-    ...) is the caller's concern, not this function's or the agent's.
+    template, and save it as .tex + .pdf in output_dir. output_dir is
+    created if it doesn't exist — where it comes from (CLI flag, prompt,
+    hardcoded test path, ...) is the caller's concern, not this function's
+    or the agent's.
 
     Compilation failure is retried, feeding tectonic's actual error text
     back to the model as feedback (same pattern as
@@ -251,6 +331,22 @@ async def generate_resume(
     comment" prompt rule for the specific bug class that motivated this),
     which the model can plausibly fix once it's shown the real error
     instead of a generic "it didn't work."
+
+    A compile that succeeds but renders to more than TARGET_PAGE_COUNT
+    pages is retried the same way, sharing the same attempt budget —
+    resume_tailor_agent already prunes content for JD relevance with full
+    context of the job description, so overflow here is expected to be a
+    template-density edge case, not the norm. The retry feedback asks for
+    formatting tightening before any further content trimming, and is
+    grounded back in the same cv_profile so a trim can't drift from it.
+
+    A compile that fits within TARGET_PAGE_COUNT but under MIN_FILL_RATIO
+    of the master template's own word count (see _reference_word_count)
+    is returned as GenerationResult(underfilled=True), not retried locally
+    — this function only ever sees cv_profile's already-selected content,
+    so it has nothing left to add back. The caller (orchestrator_agent's
+    generate->tailor edge) is what can actually fix it, by re-running
+    tailor with feedback to include more of the master CV.
 
     This does NOT retry on a missing/undownloadable tectonic binary
     (TexServiceImpl._compile_pdf lets that exception propagate rather
@@ -273,19 +369,26 @@ async def generate_resume(
     reference_body = _strip_comments(reference_body)
     body_start_line = preamble.count("\n") + 2  # +1 for \begin{document}'s own line, +1 to 1-index
 
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    filename = _safe_filename(master_tex_path, jd_analysis)
-    tex_path = Path(output_dir) / f"{filename}.tex"
-    pdf_path = Path(output_dir) / f"{filename}.pdf"
+    run_dir = Path(output_dir) / _output_subdir_name(jd_analysis)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    candidate_name = _slugify(cv_profile.contact.name) if cv_profile.contact.name else "resume"
+    company_name = _slugify(jd_analysis.company_name) if jd_analysis and jd_analysis.company_name else "company"
+    tex_path = run_dir / f"{candidate_name}_{company_name}.tex"
+    pdf_path = run_dir / f"{candidate_name}_{company_name}.pdf"
 
     tex_service = TexServiceImpl()
-    feedback: str | None = None
+    reference_word_count = _reference_word_count(tex_service, preamble, reference_body)
+    compile_error: str | None = None
+    overflow_page_count: int | None = None
     last_error = ""
+    last_page_count: int | None = None
     full_tex = ""
 
     for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
         agent = await make_resume_generation_agent()
-        instruction = _build_generation_instruction(cv_profile, reference_body, feedback)
+        instruction = _build_generation_instruction(
+            cv_profile, reference_body, compile_error, overflow_page_count
+        )
 
         response = await agent.ainvoke({"messages": [HumanMessage(content=instruction)]})
         generated: GeneratedResumeBody = response["structured_response"]
@@ -293,33 +396,70 @@ async def generate_resume(
         full_tex = f"{preamble}\\begin{{document}}\n{escaped_body}\n\\end{{document}}\n"
 
         pdf_bytes, error_output = tex_service.tex_to_pdf_with_diagnostics(full_tex, str(pdf_path))
-        if pdf_bytes is not None:
+        if pdf_bytes is None:
+            last_error = error_output
+
+            if not _error_is_body_attributable(error_output, body_start_line):
+                debug_path = run_dir / "resume.failed.tex"
+                debug_path.write_text(full_tex, encoding="utf-8")
+                raise ValueError(
+                    "Generated tex failed to compile because of what looks like a "
+                    "preamble/template problem, not the generated body — retrying "
+                    "wouldn't help, since the generation agent never touches the "
+                    f"preamble. Compiler error:\n{error_output}\n\n"
+                    f"The failed attempt was saved to {debug_path} for inspection. "
+                    "Check your master resume's preamble (packages, custom "
+                    "\\newcommand macros, margins)."
+                )
+
+            compile_error = error_output
+            overflow_page_count = None
+            continue
+
+        rendered_pages = len(PdfReader(io.BytesIO(pdf_bytes)).pages)
+        if rendered_pages <= TARGET_PAGE_COUNT:
             tex_path.write_text(full_tex, encoding="utf-8")
-            return str(tex_path), str(pdf_path), attempt
 
-        last_error = error_output
+            underfilled = False
+            fill_feedback = ""
+            if reference_word_count:
+                rendered_word_count = _word_count(pdf_bytes)
+                if rendered_word_count < MIN_FILL_RATIO * reference_word_count:
+                    underfilled = True
+                    fill_feedback = (
+                        "The last generated resume fit on one page but only used "
+                        f"~{rendered_word_count} words, well under what this "
+                        f"template comfortably holds (~{reference_word_count} "
+                        "words in the master resume itself). Too much relevant "
+                        "content was cut — add back some of the master CV's "
+                        "next-most JD-relevant experiences or bullets so the page "
+                        "is used fully instead of leaving noticeable empty space "
+                        "at the bottom."
+                    )
 
-        if not _error_is_body_attributable(error_output, body_start_line):
-            debug_path = Path(output_dir) / f"{filename}.failed.tex"
-            debug_path.write_text(full_tex, encoding="utf-8")
-            raise ValueError(
-                "Generated tex failed to compile because of what looks like a "
-                "preamble/template problem, not the generated body — retrying "
-                "wouldn't help, since the generation agent never touches the "
-                f"preamble. Compiler error:\n{error_output}\n\n"
-                f"The failed attempt was saved to {debug_path} for inspection. "
-                "Check your master resume's preamble (packages, custom "
-                "\\newcommand macros, margins)."
+            cover_letter_path = await _write_cover_letter(cv_profile, jd_analysis, run_dir)
+
+            return GenerationResult(
+                str(tex_path), str(pdf_path), attempt, underfilled, fill_feedback, cover_letter_path
             )
 
-        feedback = error_output
+        last_page_count = rendered_pages
+        compile_error = None
+        overflow_page_count = rendered_pages
 
-    # Every attempt failed to compile with a body-attributable error.
-    # Save the last attempt so there's something to actually look at
-    # instead of nothing — the raised error alone doesn't let anyone
-    # inspect the LaTeX that broke.
-    debug_path = Path(output_dir) / f"{filename}.failed.tex"
+    # Every attempt either failed to compile with a body-attributable
+    # error, or compiled but overflowed the page target. Save the last
+    # attempt so there's something to actually look at instead of nothing
+    # — the raised error alone doesn't let anyone inspect the LaTeX that
+    # broke or overflowed.
+    debug_path = run_dir / "resume.failed.tex"
     debug_path.write_text(full_tex, encoding="utf-8")
+    if last_page_count is not None:
+        raise ValueError(
+            f"Generated resume still rendered to {last_page_count} pages after "
+            f"{MAX_GENERATION_ATTEMPTS} attempts (target: {TARGET_PAGE_COUNT} page). "
+            f"The last attempt was saved to {debug_path} for inspection."
+        )
     raise ValueError(
         f"Generated tex still failed to compile after {MAX_GENERATION_ATTEMPTS} attempts. "
         f"Last compiler error:\n{last_error}\n\n"

@@ -1,4 +1,4 @@
-from weave_cv.language_models.index import get_model
+from weave_cv.language_models.index import cacheable_system_message, get_model
 from langchain.agents import create_agent
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain.messages import SystemMessage, HumanMessage
@@ -16,7 +16,7 @@ mcp_client = MultiServerMCPClient({
 
 async def _get_prompt():
     prompt = await mcp_client.get_prompt("resume_tailoring", "prompt")
-    return SystemMessage(content=prompt[0].content)
+    return cacheable_system_message(prompt[0].content)
 
 async def make_resume_tailor_agent():
     prompt = await _get_prompt()

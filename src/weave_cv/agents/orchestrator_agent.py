@@ -1,6 +1,8 @@
 """Orchestrates the full resume-tailoring pipeline as a LangGraph graph:
 
-    gather_inputs -> tailor -> verify (retry loop) -> generate
+    gather_inputs -> tailor -> verify (retry loop) -> generate (retry loop
+                                                                 back to tailor
+                                                                 on under-fill)
 
 The graph's edges are all deterministic — no LLM decides routing. The only
 branch is "did verification pass," which is a bounded retry driven by plain
@@ -20,6 +22,7 @@ of an opaque stack trace.
 
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 from typing import AsyncIterator, TypedDict, cast
 
 from langchain.messages import HumanMessage
@@ -29,7 +32,7 @@ from weave_cv.agents.cv_analyzer import make_cv_analyzer_agent
 from weave_cv.agents.jd_analyzer import analyze_job_posting
 from weave_cv.agents.resume_tailor_agent import tailor
 from weave_cv.agents.resume_verifier_agent import check_reworded_bullets
-from weave_cv.agents.resume_generation_agent import generate_resume
+from weave_cv.agents.resume_generation_agent import GenerationResult, generate_resume
 from weave_cv.schemas.cv_analysis import CVProfile
 from weave_cv.schemas.jd_analysis import JobDescriptionAnalysis
 from weave_cv.services.cv_cache import get_cached_cv_profile, save_cv_profile_to_cache
@@ -37,6 +40,7 @@ from weave_cv.services.cv_diff import diff_cv_profiles
 from weave_cv.services.jd_cache import get_cached_jd_profile, save_jd_profile_to_cache
 
 MAX_VERIFICATION_ATTEMPTS = 3
+MAX_PAGE_FIT_ATTEMPTS = 2
 
 
 # --- Errors -------------------------------------------------------------
@@ -81,6 +85,11 @@ class PipelineState(PipelineInput, total=False):
     generated_tex_path: str
     generated_pdf_path: str
     generation_attempts: int
+    cover_letter_path: str | None
+
+    page_fit_attempts: int
+    page_fit_underfilled: bool
+    page_fit_feedback: str
 
     failed_stage: str
     error: str
@@ -176,7 +185,7 @@ async def verify(original_cv: CVProfile, tailored_cv: CVProfile) -> Verification
 
 async def generate(
     cv_profile: CVProfile, master_tex_path: str, output_dir: str, jd_analysis: JobDescriptionAnalysis | None
-) -> tuple[str, str, int]:
+) -> GenerationResult:
     return await generate_resume(cv_profile, master_tex_path, output_dir, jd_analysis=jd_analysis)
 
 
@@ -206,7 +215,14 @@ async def tailor_node(state: PipelineState) -> dict:
         tailored_cv = await tailor(
             jd_profile,
             original_cv,
-            feedback=state.get("verification_feedback") or None,
+            # Re-tailoring is driven by whichever failure sent us back here
+            # — a failed verification (wrong/hallucinated content) or a
+            # generate-stage page-fit problem (too much cut, page
+            # under-filled). verification_feedback is only ever non-empty
+            # on the former, so it's a safe first choice; falling back to
+            # page_fit_feedback covers the latter without needing to know
+            # which edge routed here.
+            feedback=state.get("verification_feedback") or state.get("page_fit_feedback") or None,
         )
     except Exception as e:
         return {"failed_stage": "tailor", "error": str(e)}
@@ -226,23 +242,61 @@ async def verify_node(state: PipelineState) -> dict:
     return {"verification_passed": result.passed, "verification_feedback": result.feedback}
 
 
+def _discard_previous_generation(state: PipelineState) -> None:
+    """Each page-fit retry (see _route_after_generate's generate->tailor
+    edge) calls generate_resume() again, which mints a fresh per-run
+    subfolder (_output_subdir_name) rather than reusing the last one — so
+    without this, a retried run leaves the earlier, discarded attempt's
+    "<company> - <timestamp>" folder sitting in output_dir alongside the
+    final one. Only ever called once a new attempt has already succeeded,
+    so there's always a newer file to keep before the older one is
+    removed. A no-op on the first generate attempt, when neither key is
+    set yet."""
+    tex_path = state.get("generated_tex_path")
+    pdf_path = state.get("generated_pdf_path")
+    cover_letter_path = state.get("cover_letter_path")
+    if not tex_path and not pdf_path:
+        return
+
+    for path in (tex_path, pdf_path, cover_letter_path):
+        if path:
+            Path(path).unlink(missing_ok=True)
+
+    # All three live in the same per-run subfolder — remove it too once
+    # emptied, so a discarded attempt doesn't leave a bare, confusingly-
+    # named folder behind. (A stale cover_letter_path left un-deleted
+    # above would otherwise block this: the folder wouldn't be empty.)
+    existing_path = tex_path or pdf_path
+    assert existing_path is not None  # guaranteed by the early return above
+    run_dir = Path(existing_path).parent
+    if run_dir.exists() and not any(run_dir.iterdir()):
+        run_dir.rmdir()
+
+
 async def generate_node(state: PipelineState) -> dict:
     tailored_cv = state.get("tailored_cv")
     jd_analysis = state.get("jd_profile")
     assert tailored_cv is not None
 
+    attempt = state.get("page_fit_attempts", 0) + 1
     try:
         # cv_path is the master resume's .tex file — its template gets
         # reused by generate_resume(), not just its content.
-        tex_path, pdf_path, attempts = await generate(
+        result: GenerationResult = await generate(
             tailored_cv, state["cv_path"], state["output_dir"], jd_analysis=jd_analysis
         )
     except Exception as e:
         return {"failed_stage": "generate", "error": str(e)}
+
+    _discard_previous_generation(state)
     return {
-        "generated_tex_path": tex_path,
-        "generated_pdf_path": pdf_path,
-        "generation_attempts": attempts,
+        "generated_tex_path": result.tex_path,
+        "generated_pdf_path": result.pdf_path,
+        "generation_attempts": result.attempts,
+        "cover_letter_path": result.cover_letter_path,
+        "page_fit_attempts": attempt,
+        "page_fit_underfilled": result.underfilled,
+        "page_fit_feedback": result.fill_feedback,
     }
 
 
@@ -265,6 +319,19 @@ def _route_after_verify(state: PipelineState) -> str:
     return "tailor"
 
 
+def _route_after_generate(state: PipelineState) -> str:
+    if state.get("failed_stage"):
+        return "end"
+    if not state.get("page_fit_underfilled"):
+        return "end"
+    if state.get("page_fit_attempts", 0) >= MAX_PAGE_FIT_ATTEMPTS:
+        # Give up trying to fill the page further — a compiled, one-page
+        # (if slightly under-filled) resume beats burning more attempts
+        # or aborting a pipeline that otherwise succeeded.
+        return "end"
+    return "tailor"
+
+
 def build_resume_pipeline_graph():
     graph = StateGraph(PipelineState)
 
@@ -279,7 +346,9 @@ def build_resume_pipeline_graph():
     graph.add_conditional_edges(
         "verify", _route_after_verify, {"tailor": "tailor", "generate": "generate", "end": END}
     )
-    graph.add_edge("generate", END)
+    graph.add_conditional_edges(
+        "generate", _route_after_generate, {"tailor": "tailor", "end": END}
+    )
 
     return graph.compile(name="Resume-Tailoring-Pipeline")
 
