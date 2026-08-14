@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
-from weave_cv.agents.orchestrator_agent import stream_resume_pipeline
+from weave_cv.agents.orchestrator_agent import MAX_PAGE_FIT_ATTEMPTS, stream_resume_pipeline
 from weave_cv.batch import BatchFileError, read_job_urls
 from weave_cv.config import CONFIG_PATH, load_config, save_config
 from weave_cv.services import cv_cache, jd_cache
@@ -329,13 +329,31 @@ async def _run_with_progress(job_url: str, cv_path: str, output_dir: str) -> dic
                 elif node_name == "generate":
                     attempts = update.get("generation_attempts")
                     suffix = f" ({attempts} attempt{'s' if attempts != 1 else ''})" if attempts else ""
-                    console.print(f"[dim]{elapsed:5.1f}s[/dim] [green]✓[/green] {label}{suffix}")
+                    still_retrying = (
+                        update.get("page_fit_underfilled")
+                        and update.get("page_fit_attempts", 0) < MAX_PAGE_FIT_ATTEMPTS
+                    )
+                    if still_retrying:
+                        feedback = update.get("page_fit_feedback") or "no reason given"
+                        console.print(
+                            f"[dim]{elapsed:5.1f}s[/dim] [yellow]…[/yellow] {label}{suffix} — "
+                            f"page under-filled, retrying: {feedback}"
+                        )
+                        current_label = f"{_STAGE_LABELS['tailor']} (retry)"
+                    else:
+                        console.print(f"[dim]{elapsed:5.1f}s[/dim] [green]✓[/green] {label}{suffix}")
                 else:
                     console.print(f"[dim]{elapsed:5.1f}s[/dim] [green]✓[/green] {label}")
 
-                # No "next stage" line once generate succeeds — it's the
-                # terminal stage, there's nothing left to announce.
-                if not update.get("failed_stage") and node_name != "generate":
+                # No "next stage" line once generate actually finishes (as
+                # opposed to looping back to tailor for an under-fill
+                # retry) — it's the terminal stage in that case, nothing
+                # left to announce.
+                is_terminal_generate = node_name == "generate" and not (
+                    update.get("page_fit_underfilled")
+                    and update.get("page_fit_attempts", 0) < MAX_PAGE_FIT_ATTEMPTS
+                )
+                if not update.get("failed_stage") and not is_terminal_generate:
                     console.print(f"[cyan]▶[/cyan] {current_label}...")
         finally:
             ticker.cancel()
@@ -397,6 +415,8 @@ def tailor(
     console.print()
     typer.secho(f"Tex saved to: {state['generated_tex_path']}", fg=typer.colors.GREEN)
     typer.secho(f"PDF saved to: {state['generated_pdf_path']}", fg=typer.colors.GREEN)
+    if state.get("cover_letter_path"):
+        typer.secho(f"Cover letter saved to: {state['cover_letter_path']}", fg=typer.colors.GREEN)
 
 
 def _short_label(url: str, max_len: int = 57) -> str:

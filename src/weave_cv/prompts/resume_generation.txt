@@ -35,6 +35,15 @@ outside your output, verbatim from the original template.
   double-escaped.
 - Match the reference's contact-block layout (name, location, then a line
   of phone/email/links) using the CVProfile's contact fields.
+- Every link in a project's `links` field MUST appear in your output as a
+  `\href{url}{label}` — never drop one, and never render it as plain,
+  unlinked text. Match however the reference body itself hyperlinks things
+  (a project name wrapped in `\href{...}{...}`, a small icon+href next to
+  the heading, whatever pattern it actually uses — including its own
+  convention for multiple links on one entry, if the reference shows one).
+  If the reference has no project links to copy the pattern from, reuse
+  the same `\href{url}{label}` macro the contact block already
+  demonstrates instead of inventing new markup.
 - Never write a LaTeX comment (a bare, unescaped `%` starting one) — not
   a note to yourself, not an aside about a choice you made, nothing, and
   not a decorative section-divider banner either (e.g.

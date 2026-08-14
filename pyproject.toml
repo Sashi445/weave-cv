@@ -1,6 +1,6 @@
 [project]
 name = "weave-cv"
-version = "0.1.8"
+version = "0.1.9"
 description = "An agent that tailors your resume to a job posting — without inventing anything new"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -17,6 +17,7 @@ dependencies = [
     "mcp>=1.28.1,<2",
     "openpyxl>=3.1.5",
     "pypandoc>=1.17",
+    "pypdf>=5.0.0",
     "rich>=13.9.0",
     "texsoup>=0.3.3",
     "tomli-w>=1.2.0",
