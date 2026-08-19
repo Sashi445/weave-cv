@@ -1,4 +1,5 @@
 import io
+import json
 import re
 import tempfile
 from dataclasses import dataclass
@@ -161,18 +162,19 @@ def _slugify(text: str) -> str:
 
 
 def _output_subdir_name(jd_analysis: JobDescriptionAnalysis | None) -> str:
-    """"<company name> - <timestamp>" — every generation run gets its own
-    subfolder under output_dir, named by company rather than by master
-    template, since the resume naturally belongs with its job.  Timestamp
-    keeps microsecond precision even though only date+time is shown in
-    spirit: a date-only name collides on same-day reruns against the same
-    company (silently overwriting the earlier folder), and even
-    second-only precision isn't safe once jobs genuinely run in parallel
-    (agents/orchestrator_agent.py can run several pipelines concurrently
-    via cli.py's `batch` command — two same-company jobs finishing
-    generation in the same second would otherwise collide)."""
+    """"<company name> - <ddMonYYYY_HH-MM-SS>" — every generation run gets
+    its own subfolder under output_dir, named by company rather than by
+    master template, since the resume naturally belongs with its job.
+    Second-only precision here is a deliberate readability tradeoff over
+    the old microsecond-suffixed timestamp: a date-only name would still
+    collide on same-day reruns against the same company (silently
+    overwriting the earlier folder), but two same-company jobs finishing
+    generation in the exact same second (agents/orchestrator_agent.py can
+    run several pipelines concurrently via cli.py's `batch` command) is
+    now a real, if narrow, residual collision risk this format accepts
+    in exchange for a name a human can actually read at a glance."""
     company_name = _slugify(jd_analysis.company_name) if jd_analysis and jd_analysis.company_name else "company"
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    timestamp = datetime.now().strftime("%d%b%Y_%H-%M-%S")
     return f"{company_name} - {timestamp}"
 
 
@@ -230,6 +232,7 @@ class GenerationResult:
     underfilled: bool = False
     fill_feedback: str = ""
     cover_letter_path: str | None = None
+    job_posting_path: str | None = None
 
 
 def _word_count(pdf_bytes: bytes) -> int:
@@ -275,6 +278,28 @@ async def _write_cover_letter(
     return str(cover_letter_path)
 
 
+def _write_job_posting_file(
+    jd_analysis: JobDescriptionAnalysis | None, job_url: str | None, run_dir: Path
+) -> str | None:
+    """Best-effort, same reasoning as _write_cover_letter — a bonus
+    artifact alongside the resume, not the resume itself, so a failure
+    here must never take down an otherwise-successful generation. No LLM
+    call involved (jd_analysis is already-extracted structured data), so
+    the only realistic failure mode is a disk I/O error, not a content
+    one — narrowly caught rather than swallowing every exception.
+    Returns None — silently — on either "can't" (no jd_analysis) or
+    "failed", same as any other skip."""
+    if jd_analysis is None:
+        return None
+    payload = {"job_url": job_url, **jd_analysis.model_dump(mode="json")}
+    job_posting_path = run_dir / "job_posting.json"
+    try:
+        job_posting_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError:
+        return None
+    return str(job_posting_path)
+
+
 def _build_generation_instruction(
     cv_profile: CVProfile,
     reference_body: str,
@@ -314,7 +339,7 @@ def _build_generation_instruction(
 
 async def generate_resume(
     cv_profile: CVProfile, master_tex_path: str, output_dir: str,
-    jd_analysis: JobDescriptionAnalysis | None
+    jd_analysis: JobDescriptionAnalysis | None, job_url: str | None = None,
 ) -> GenerationResult:
     """Generate a tailored resume from cv_profile, reusing master_tex_path's
     template, and save it as .tex + .pdf in output_dir. output_dir is
@@ -438,9 +463,11 @@ async def generate_resume(
                     )
 
             cover_letter_path = await _write_cover_letter(cv_profile, jd_analysis, run_dir)
+            job_posting_path = _write_job_posting_file(jd_analysis, job_url, run_dir)
 
             return GenerationResult(
-                str(tex_path), str(pdf_path), attempt, underfilled, fill_feedback, cover_letter_path
+                str(tex_path), str(pdf_path), attempt, underfilled, fill_feedback,
+                cover_letter_path, job_posting_path,
             )
 
         last_page_count = rendered_pages

@@ -1,11 +1,12 @@
 [project]
 name = "weave-cv"
-version = "0.1.9"
+version = "0.2.0"
 description = "An agent that tailors your resume to a job posting — without inventing anything new"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "crawl4ai>=0.9.1",
+    "httpx>=0.28.1",
     "langchain>=1.3.13",
     "langchain-mcp-adapters>=0.3.0",
     "langchain-openai>=1.4.1",
@@ -16,9 +17,11 @@ dependencies = [
     "langchain-deepseek>=1.0.0",
     "mcp>=1.28.1,<2",
     "openpyxl>=3.1.5",
+    "playwright>=1.62.0",
     "pypandoc>=1.17",
     "pypdf>=5.0.0",
     "rich>=13.9.0",
+    "tavily-python>=0.5.0",
     "texsoup>=0.3.3",
     "tomli-w>=1.2.0",
     "typer>=0.15.1",
