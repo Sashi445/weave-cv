@@ -25,17 +25,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, TypedDict, cast
 
-from langchain.messages import HumanMessage
 from langgraph.graph import StateGraph, START, END
 
-from weave_cv.agents.cv_analyzer import make_cv_analyzer_agent
+from weave_cv.agents.cv_analyzer import analyze_cv
 from weave_cv.agents.jd_analyzer import analyze_job_posting
 from weave_cv.agents.resume_tailor_agent import tailor
 from weave_cv.agents.resume_verifier_agent import check_reworded_bullets
 from weave_cv.agents.resume_generation_agent import GenerationResult, generate_resume
 from weave_cv.schemas.cv_analysis import CVProfile
 from weave_cv.schemas.jd_analysis import JobDescriptionAnalysis
-from weave_cv.services.cv_cache import get_cached_cv_profile, save_cv_profile_to_cache
+from weave_cv.services import db
 from weave_cv.services.cv_diff import diff_cv_profiles
 from weave_cv.services.jd_cache import get_cached_jd_profile, save_jd_profile_to_cache
 
@@ -86,6 +85,7 @@ class PipelineState(PipelineInput, total=False):
     generated_pdf_path: str
     generation_attempts: int
     cover_letter_path: str | None
+    job_posting_path: str | None
 
     page_fit_attempts: int
     page_fit_underfilled: bool
@@ -112,29 +112,6 @@ async def _analyze_jd(job_url: str) -> JobDescriptionAnalysis:
     return profile
 
 
-async def _analyze_cv(cv_path: str) -> CVProfile:
-    """Cache-first: the master resume rarely changes between runs, so a
-    cache hit (keyed on the file's content hash — see services/cv_cache.py)
-    skips both the agent-construction MCP round trip and the LLM call
-    entirely, returning the previously extracted CVProfile as-is. Only a
-    cache miss pays for a real analysis, whose result is then cached for
-    next time.
-    """
-    cached = get_cached_cv_profile(cv_path)
-    if cached is not None:
-        return cached
-
-    agent = await make_cv_analyzer_agent()
-    result = await agent.ainvoke({
-        "messages": [
-            HumanMessage(content=f"Analyze my resume located at '{cv_path}'")
-        ]
-    })
-    profile = result["structured_response"]
-    save_cv_profile_to_cache(cv_path, profile)
-    return profile
-
-
 async def gather_inputs(
     job_url: str, cv_path: str
 ) -> tuple[JobDescriptionAnalysis, CVProfile]:
@@ -144,7 +121,7 @@ async def gather_inputs(
     in code rather than left to an LLM to decide to batch)."""
     jd_result, cv_result = await asyncio.gather(
         _analyze_jd(job_url),
-        _analyze_cv(cv_path),
+        analyze_cv(cv_path),
         return_exceptions=True,
     )
 
@@ -184,9 +161,10 @@ async def verify(original_cv: CVProfile, tailored_cv: CVProfile) -> Verification
 
 
 async def generate(
-    cv_profile: CVProfile, master_tex_path: str, output_dir: str, jd_analysis: JobDescriptionAnalysis | None
+    cv_profile: CVProfile, master_tex_path: str, output_dir: str, jd_analysis: JobDescriptionAnalysis | None,
+    job_url: str | None = None,
 ) -> GenerationResult:
-    return await generate_resume(cv_profile, master_tex_path, output_dir, jd_analysis=jd_analysis)
+    return await generate_resume(cv_profile, master_tex_path, output_dir, jd_analysis=jd_analysis, job_url=job_url)
 
 
 # --- Nodes ----------------------------------------------------------------
@@ -255,17 +233,19 @@ def _discard_previous_generation(state: PipelineState) -> None:
     tex_path = state.get("generated_tex_path")
     pdf_path = state.get("generated_pdf_path")
     cover_letter_path = state.get("cover_letter_path")
+    job_posting_path = state.get("job_posting_path")
     if not tex_path and not pdf_path:
         return
 
-    for path in (tex_path, pdf_path, cover_letter_path):
+    for path in (tex_path, pdf_path, cover_letter_path, job_posting_path):
         if path:
             Path(path).unlink(missing_ok=True)
 
-    # All three live in the same per-run subfolder — remove it too once
+    # All four live in the same per-run subfolder — remove it too once
     # emptied, so a discarded attempt doesn't leave a bare, confusingly-
-    # named folder behind. (A stale cover_letter_path left un-deleted
-    # above would otherwise block this: the folder wouldn't be empty.)
+    # named folder behind. (A stale cover_letter_path/job_posting_path
+    # left un-deleted above would otherwise block this: the folder
+    # wouldn't be empty.)
     existing_path = tex_path or pdf_path
     assert existing_path is not None  # guaranteed by the early return above
     run_dir = Path(existing_path).parent
@@ -283,7 +263,8 @@ async def generate_node(state: PipelineState) -> dict:
         # cv_path is the master resume's .tex file — its template gets
         # reused by generate_resume(), not just its content.
         result: GenerationResult = await generate(
-            tailored_cv, state["cv_path"], state["output_dir"], jd_analysis=jd_analysis
+            tailored_cv, state["cv_path"], state["output_dir"], jd_analysis=jd_analysis,
+            job_url=state.get("job_url"),
         )
     except Exception as e:
         return {"failed_stage": "generate", "error": str(e)}
@@ -294,6 +275,7 @@ async def generate_node(state: PipelineState) -> dict:
         "generated_pdf_path": result.pdf_path,
         "generation_attempts": result.attempts,
         "cover_letter_path": result.cover_letter_path,
+        "job_posting_path": result.job_posting_path,
         "page_fit_attempts": attempt,
         "page_fit_underfilled": result.underfilled,
         "page_fit_feedback": result.fill_feedback,
@@ -356,14 +338,39 @@ def build_resume_pipeline_graph():
 resume_pipeline_graph = build_resume_pipeline_graph()
 
 
+def _record_applied_job(job_url: str, state: PipelineState) -> None:
+    """Records this run's outcome in applied_jobs (see services/db.py),
+    regardless of success or failure — this is what lets
+    `batch --from-db` (and any future caller) know a job_url has already
+    been through the pipeline at least once, and what `discover` checks
+    to avoid resurfacing something already applied to. Called from both
+    entrypoints below so every caller gets this for free, rather than
+    each one (CLI's tailor/batch commands, or any future caller)
+    remembering to record it separately."""
+    jd_profile = state.get("jd_profile")
+    failed_stage = state.get("failed_stage")
+    db.save_applied_job(
+        job_url=job_url,
+        company_name=jd_profile.company_name if jd_profile else None,
+        title=jd_profile.title if jd_profile else None,
+        status="failed" if failed_stage else "success",
+        tex_path=state.get("generated_tex_path"),
+        pdf_path=state.get("generated_pdf_path"),
+        cover_letter_path=state.get("cover_letter_path"),
+        failed_stage=failed_stage,
+        error=state.get("error"),
+    )
+
+
 async def run_resume_pipeline(job_url: str, cv_path: str, output_dir: str) -> PipelineState:
-    result = await resume_pipeline_graph.ainvoke({
+    result = cast(PipelineState, await resume_pipeline_graph.ainvoke({
         "job_url": job_url,
         "cv_path": cv_path,
         "output_dir": output_dir,
         "verification_attempts": 0,
-    })
-    return cast(PipelineState, result)
+    }))
+    _record_applied_job(job_url, result)
+    return result
 
 
 async def stream_resume_pipeline(
@@ -372,7 +379,12 @@ async def stream_resume_pipeline(
     """Same pipeline as run_resume_pipeline(), but yields (node_name,
     state_update) as each stage completes instead of only returning the
     final state — for callers (like the CLI) that want live progress
-    instead of sitting silent for the whole run."""
+    instead of sitting silent for the whole run. Accumulates state
+    internally (mirroring what every caller already does externally, e.g.
+    cli.py's final_state) purely so _record_applied_job has a complete
+    final state to record once streaming ends — callers still only ever
+    see the per-node updates yielded below, not this accumulation."""
+    final_state: PipelineState = cast(PipelineState, {})
     async for chunk in resume_pipeline_graph.astream(
         {
             "job_url": job_url,
@@ -383,4 +395,7 @@ async def stream_resume_pipeline(
         stream_mode="updates",
     ):
         for node_name, update in chunk.items():
+            final_state.update(update)
             yield node_name, update
+
+    _record_applied_job(job_url, final_state)
