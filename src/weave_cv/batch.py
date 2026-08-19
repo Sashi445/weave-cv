@@ -11,7 +11,8 @@ message is cheaper and clearer for the user than that.
 
 from pathlib import Path
 
-_URL_COLUMN_CANDIDATES = ["job_url", "url", "link", "job_link"]
+CANONICAL_URL_COLUMN = "job_url"
+_URL_COLUMN_CANDIDATES = [CANONICAL_URL_COLUMN, "url", "link", "job_link"]
 
 
 class BatchFileError(ValueError):

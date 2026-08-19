@@ -4,6 +4,7 @@ from langchain.agents import create_agent
 from langchain_core.messages import SystemMessage, HumanMessage
 from weave_cv.mcp import mcp_script_path
 from weave_cv.schemas.cv_analysis import CVProfile
+from weave_cv.services.cv_cache import get_cached_cv_profile, save_cv_profile_to_cache
 
 client = MultiServerMCPClient({
     "cv_analyzer": {
@@ -39,3 +40,29 @@ async def make_cv_analyzer_agent():
         response_format=CVProfile,
         name="CV-Analyzer"
     )
+
+
+async def analyze_cv(cv_path: str) -> CVProfile:
+    """Cache-first: the master resume rarely changes between runs, so a
+    cache hit (keyed on the file's content hash — see services/cv_cache.py)
+    skips both the agent-construction MCP round trip and the LLM call
+    entirely, returning the previously extracted CVProfile as-is. Only a
+    cache miss pays for a real analysis, whose result is then cached for
+    next time. Shared by orchestrator_agent's tailor pipeline and the
+    standalone `discover` command — both need "the user's CVProfile,
+    computed once" and neither should duplicate this cache-or-analyze
+    logic on its own.
+    """
+    cached = get_cached_cv_profile(cv_path)
+    if cached is not None:
+        return cached
+
+    agent = await make_cv_analyzer_agent()
+    result = await agent.ainvoke({
+        "messages": [
+            HumanMessage(content=f"Analyze my resume located at '{cv_path}'")
+        ]
+    })
+    profile = result["structured_response"]
+    save_cv_profile_to_cache(cv_path, profile)
+    return profile

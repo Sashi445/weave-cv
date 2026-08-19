@@ -21,6 +21,7 @@ class WeaveCVConfig(BaseModel):
     api_key: str | None = None
     model: str | None = None
     provider: str | None = None
+    tavily_api_key: str | None = None
 
 
 def load_config() -> WeaveCVConfig:
